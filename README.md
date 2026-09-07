@@ -83,6 +83,33 @@ are keys for it:
 
 Switching it on is filling in two values and restarting. No code change.
 
+## The webhook
+
+The browser callback (`/verify`) is the normal path, but it only runs if the
+reader's tab survives long enough to fire it. Someone who pays and then closes
+the window, or loses signal on the way back, would otherwise be charged with
+nothing recorded. Razorpay reports the same payment to
+`POST /api/payments/webhook` server-to-server, so the purchase lands either way.
+
+Both routes credit through the same `_credit()` step, and it is guarded by
+`where status = 'pending'` — so the callback, a retry of it, and the webhook can
+all arrive and only the first one credits anything. Without that a reader who
+paid once could end up owed six letters for a three-letter plan.
+
+Set it up at **Razorpay Dashboard > Settings > Webhooks**:
+
+| Field | Value |
+| --- | --- |
+| Webhook URL | `https://<your-service>.onrender.com/api/payments/webhook` |
+| Secret | A random string you invent, also set as `RAZORPAY_WEBHOOK_SECRET` |
+| Active Events | `payment.captured` and `payment.failed` |
+
+The secret is not something Razorpay gives you — it is a shared password you
+choose, used to sign each delivery so nobody else can post fake payments at the
+API. An unsigned or wrongly signed request gets a 403. Anything else — an
+unknown order, an event we do not handle — is answered 200, because Razorpay
+retries non-2xx replies and eventually disables a webhook that keeps failing.
+
 ## Endpoints
 
 | Method | Path | What it does |
@@ -93,6 +120,7 @@ Switching it on is filling in two values and restarting. No code change.
 | `GET` | `/api/subscriptions/{id}` | Read one back |
 | `POST` | `/api/subscriptions/{id}/order` | Re-open checkout for an unpaid sign-up |
 | `POST` | `/api/subscriptions/{id}/verify` | Confirm a Razorpay payment (signature checked) |
+| `POST` | `/api/payments/webhook` | Razorpay's own report of the same payment |
 | `GET` | `/api/admin/subscriptions` | List and search sign-ups |
 | `GET` | `/api/admin/subscriptions.csv` | Address labels for the month's paid readers |
 | `POST` | `/api/admin/subscriptions/{id}/status` | Set a status by hand |

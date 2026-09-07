@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from .. import cycles, identity, payments, plans
 from ..config import get_settings, make_reference
@@ -107,6 +108,52 @@ async def _payment_for(row: dict, payment: dict | None = None) -> PaymentOut:
         key_id=settings.razorpay_key_id,
         order_id=order_id,
     )
+
+
+async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
+    """Mark one purchase paid and add the letters it bought.
+
+    Both the browser callback and the webhook come through here, so the two can
+    never drift apart. `where status = 'pending'` is what makes it safe for both
+    to arrive — and for either to be retried — because only the first one to
+    land credits anything. Without that guard a reader who paid once could end
+    up owed six letters for a three-letter plan.
+    """
+    credited = await fetch_one(
+        """
+        update payments set
+            status = 'paid',
+            razorpay_payment_id = coalesce(%s, razorpay_payment_id),
+            paid_at = coalesce(paid_at, now()),
+            updated_at = now()
+        where id = %s and status = 'pending'
+        returning *
+        """,
+        (razorpay_payment_id, payment["id"]),
+    )
+
+    if not credited:
+        return await fetch_one(
+            "select * from subscribers where id = %s", (payment["subscriber_id"],)
+        )
+
+    # Letters are *added*, never assigned. A reader with two still owed who buys
+    # three more ends up owed five; overwriting would quietly swallow the two
+    # they had already paid for.
+    row = await fetch_one(
+        """
+        update subscribers set
+            status = 'active',
+            deliveries_remaining = deliveries_remaining + %s,
+            paid_at = coalesce(paid_at, now()),
+            updated_at = now()
+        where id = %s
+        returning *
+        """,
+        (credited["plan_months"], payment["subscriber_id"]),
+    )
+    log.info("%s paid for %d letters", row["reference"], credited["plan_months"])
+    return row
 
 
 @router.get("/config")
@@ -317,38 +364,79 @@ async def verify_payment(subscription_id: str, body: RazorpayVerifyIn) -> Subscr
             "please try again or write to us.",
         )
 
-    # `where status = 'pending'` is the guard that makes this idempotent: the
-    # browser callback, a retry of it and the webhook can all arrive, and only
-    # the first one credits the purchase.
-    credited = await fetch_one(
-        """
-        update payments set
-            status = 'paid', razorpay_payment_id = %s,
-            paid_at = coalesce(paid_at, now()), updated_at = now()
-        where id = %s and status = 'pending'
-        returning *
-        """,
-        (body.razorpay_payment_id, payment["id"]),
-    )
-
-    if credited:
-        # Envelopes are *added*, never assigned. A reader with two still owed
-        # who buys three more ends up owed five — overwriting would quietly
-        # swallow the two they had already paid for.
-        row = await fetch_one(
-            """
-            update subscribers set
-                status = 'active',
-                deliveries_remaining = deliveries_remaining + %s,
-                paid_at = coalesce(paid_at, now()),
-                updated_at = now()
-            where id = %s
-            returning *
-            """,
-            (credited["plan_months"], row["id"]),
-        )
-        log.info("%s paid for %d letters", row["reference"], credited["plan_months"])
-    else:
-        row = await fetch_one("select * from subscribers where id = %s", (row["id"],))
+    row = await _credit(payment, body.razorpay_payment_id)
 
     return SubscribeResponse(subscription=_out(row), payment=None)
+
+
+# ── Razorpay webhook ────────────────────────────────────────────────────────
+#
+# The browser callback above is the normal path, but it only runs if the
+# reader's tab survives long enough to fire it. Someone who pays and then closes
+# the window, or loses signal on the way back, would otherwise be charged while
+# their row sat unpaid. Razorpay reports the same payment here, server to
+# server, so the purchase lands either way.
+#
+# Razorpay Dashboard > Settings > Webhooks
+#   URL     https://<your-service>.onrender.com/api/payments/webhook
+#   Secret  a string you invent, also set as RAZORPAY_WEBHOOK_SECRET
+#   Events  payment.captured, payment.failed
+
+# Razorpay retries anything that is not 2xx, and disables a webhook that keeps
+# failing. So: verify, do what can be done, and answer 200 regardless — an event
+# about an order we do not recognise is not worth retrying for a week.
+_ACK = {"status": "ok"}
+
+
+@router.post("/payments/webhook", include_in_schema=False)
+async def razorpay_webhook(request: Request) -> dict:
+    # The signature covers the exact bytes Razorpay sent, so this has to be the
+    # raw body — parsing first and re-serialising would change it.
+    raw = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+
+    if not await payments.verify_webhook(body=raw, signature=signature):
+        # 403 and not 200: a bad signature means this did not come from
+        # Razorpay, or RAZORPAY_WEBHOOK_SECRET does not match the dashboard.
+        # Worth surfacing rather than silently accepting.
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
+
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("razorpay webhook: body was not JSON")
+        return _ACK
+
+    kind = event.get("event", "")
+    entity = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {}) or {}
+    order_id = entity.get("order_id")
+
+    if kind not in ("payment.captured", "payment.failed") or not order_id:
+        log.info("razorpay webhook: ignoring %s", kind or "(no event name)")
+        return _ACK
+
+    payment = await fetch_one(
+        "select * from payments where razorpay_order_id = %s", (order_id,)
+    )
+    if not payment:
+        # An order from another system, or one whose sign-up was discarded as
+        # abandoned. Nothing to do, and nothing Razorpay should retry.
+        log.info("razorpay webhook: %s for unknown order %s", kind, order_id)
+        return _ACK
+
+    if kind == "payment.captured":
+        await _credit(payment, entity.get("id"))
+    else:
+        # Only an attempt still open is marked failed — a later failure event
+        # must never undo a payment that has already been credited.
+        await fetch_one(
+            """
+            update payments set status = 'failed', updated_at = now()
+            where id = %s and status = 'pending'
+            returning id
+            """,
+            (payment["id"],),
+        )
+        log.info("razorpay webhook: payment failed for order %s", order_id)
+
+    return _ACK
