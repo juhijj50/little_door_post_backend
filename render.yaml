@@ -35,11 +35,12 @@ services:
     healthCheckPath: /api/health
 
     envVars:
-      # requirements.txt pins psycopg[binary], whose wheels are built per
-      # Python version. Pinning here keeps a future Render default from
-      # landing on a version with no wheel to install.
-      - key: PYTHON_VERSION
-        value: "3.13.4"
+      # No PYTHON_VERSION on purpose. Pinning it here does nothing unless the
+      # service was created from this Blueprint, which is easy to get wrong,
+      # and a version Render does not stock fails the build outright.
+      # requirements.txt is pinned to releases that publish wheels for current
+      # CPython instead, so whichever interpreter Render picks, nothing has to
+      # be compiled from source.
 
       # Neon connection string. The postgresql+psycopg:// form Neon offers for
       # SQLAlchemy is accepted too — app/config.py normalises the scheme.

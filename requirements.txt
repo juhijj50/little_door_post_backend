@@ -1,8 +1,14 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-psycopg[binary,pool]==3.2.3
-pydantic==2.10.4
-pydantic-settings==2.7.0
-email-validator==2.2.0
-# Payments — the keys go in .env once Razorpay approves the account.
+# Versions carry prebuilt wheels for current CPython, including 3.14, which is
+# what Render installs by default. Older pins had none: pip fell back to
+# compiling pydantic-core from Rust source and the build died on Render's
+# read-only cargo registry. If you bump these, check the new version publishes
+# a cp3xx wheel rather than only a source tarball.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+psycopg[binary,pool]==3.3.5
+pydantic==2.13.5
+pydantic-settings==2.15.0
+email-validator==2.3.0
+
+# Payments. The keys live in .env.
 razorpay==2.0.1

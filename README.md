@@ -53,6 +53,20 @@ Everything lives in `backend/.env` — see `.env.example` for the full list.
 | `CORS_ORIGINS` | Comma-separated origins allowed to call the API. No trailing slash — a browser never sends one |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | **Empty until the account is approved** |
 
+## A note on the pinned versions
+
+`requirements.txt` pins releases that publish **prebuilt wheels for current
+CPython, 3.14 included**. That is not incidental. Render installs a recent
+Python by default, and `pydantic-core` and `psycopg-binary` are compiled
+extensions: on a version they have no wheel for, pip falls back to building
+`pydantic-core` from Rust source, which dies on Render's read-only cargo
+registry with a `maturin failed` error that reads like a pip problem.
+
+So when bumping anything here, check the new version publishes a `cp3xx` wheel
+rather than only a source tarball. Pinning `PYTHON_VERSION` is the more fragile
+fix — it applies only to services created from the Blueprint, and a version
+Render does not stock fails the build outright.
+
 ## Payments
 
 The Razorpay integration is written and wired up, but switched off until there
