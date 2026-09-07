@@ -50,9 +50,7 @@ Everything lives in `backend/.env` — see `.env.example` for the full list.
 | --- | --- |
 | `DATABASE_URL` | Neon connection string (pooled or direct; the `postgresql+psycopg://` form Neon offers for SQLAlchemy is accepted too) |
 | `ADMIN_TOKEN` | Guards `/api/admin/*`. Set it to something long and random |
-| `SUBSCRIPTION_PRICE_INR` | Price of one month's envelope |
-| `SIGNUP_WINDOW` | `Automatic` (20th → 2nd), `Open now`, or `Closed` |
-| `CORS_ORIGINS` | Comma-separated origins allowed to call the API |
+| `CORS_ORIGINS` | Comma-separated origins allowed to call the API. No trailing slash — a browser never sends one |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | **Empty until the account is approved** |
 
 ## Payments

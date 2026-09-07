@@ -52,16 +52,10 @@ services:
 
       # The site's exact origin: scheme included, no trailing slash, no path.
       # Comma-separate several. Get this wrong and the API looks healthy while
-      # every sign-up fails in the browser with a CORS error.
+      # every sign-up fails in the browser with a CORS error. (Prices and
+      # sign-up windows are not here — they live in the database.)
       - key: CORS_ORIGINS
         sync: false
-
-      - key: SUBSCRIPTION_PRICE_INR
-        value: "279"
-
-      # "Automatic" opens the 20th and closes the 2nd.
-      - key: SIGNUP_WINDOW
-        value: Automatic
 
       # Leave all three blank until Razorpay approves the account. While they
       # are blank the API reports payments as unavailable, sign-ups are saved

@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     )
 
     database_url: str = ""
-    port: int = 8000
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     admin_token: str = ""
 
@@ -44,7 +43,15 @@ class Settings(BaseSettings):
 
     @property
     def origins(self) -> list[str]:
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        """The exact origins allowed to call the API.
+
+        Trailing slashes are stripped, because pasting a site's URL from the
+        address bar brings one along and a browser never sends it: Chrome puts
+        `https://site.com` in the Origin header, so `https://site.com/` in this
+        list matches nothing. The site would load, every sign-up would fail with
+        a CORS error, and the API log would look perfectly healthy.
+        """
+        return [o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def payments_enabled(self) -> bool:
