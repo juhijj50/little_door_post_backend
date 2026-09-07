@@ -7,7 +7,7 @@ form shows are written in one place.
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -30,6 +30,9 @@ class SubscriberIn(BaseModel):
     for the international waitlist — see the model validator at the bottom."""
 
     region: Literal["india", "international"]
+    # How many monthly envelopes they are buying. The price for it comes from
+    # the plans table, never from the request — a client cannot name its own.
+    plan_months: Literal[1, 3, 6] = 1
 
     full_name: Str = Field(min_length=1, max_length=120)
     email: EmailStr
@@ -134,8 +137,16 @@ class SubscriptionOut(BaseModel):
     region: str
     status: str
     full_name: str
-    amount_inr: int | None
     cycle: str
+    plan_months: int
+    currency: str | None = None
+    amount_minor: int | None = Field(
+        default=None, description="In paise (INR) or cents (USD). 27900 = ₹279."
+    )
+    amount_display: str | None = Field(
+        default=None, description="The same amount written for people: '₹279'."
+    )
+    deliveries_remaining: int = 0
 
 
 class PaymentOut(BaseModel):
@@ -147,7 +158,11 @@ class PaymentOut(BaseModel):
 
     enabled: bool
     provider: Literal["razorpay"] = "razorpay"
-    amount_inr: int | None = None
+    amount_minor: int | None = Field(
+        default=None,
+        description="In paise (INR) or cents (USD) — the unit Razorpay Checkout wants.",
+    )
+    amount_display: str | None = Field(default=None, description="e.g. '₹279'.")
     currency: str = "INR"
     key_id: str | None = None
     order_id: str | None = None
@@ -168,5 +183,44 @@ class RazorpayVerifyIn(BaseModel):
 
 
 class AdminStatusIn(BaseModel):
-    status: Literal["pending", "paid", "failed", "cancelled", "waitlist"]
+    status: Literal["pending", "active", "expired", "failed", "cancelled"]
     note: Str | None = Field(default=None, max_length=600)
+
+
+class CycleIn(BaseModel):
+    """Overrides one month's sign-up window. Both dates must carry a timezone,
+    so there is never a question of whose midnight is meant."""
+
+    opens_at: datetime
+    closes_at: datetime
+    note: Str | None = Field(default=None, max_length=600)
+
+    @model_validator(mode="after")
+    def check_order(self):
+        if self.closes_at <= self.opens_at:
+            raise ValueError("closes_at: the window has to close after it opens")
+        return self
+
+
+class PlanIn(BaseModel):
+    """Sets one price.
+
+    **Amounts are in the currency's smallest unit — paise for INR, cents for
+    USD.** 27900 is ₹279; 1500 is $15. That is the unit Razorpay's API takes, so
+    the value is passed straight through with no conversion anywhere.
+    """
+
+    amount_minor: int = Field(
+        gt=0,
+        le=100_000_000,
+        description=(
+            "Price in PAISE (INR) or CENTS (USD), not rupees or dollars. "
+            "27900 = ₹279. 1500 = $15. Sending 279 would mean ₹2.79."
+        ),
+        examples=[27900],
+    )
+    currency: Literal["INR", "USD"] | None = Field(
+        default=None,
+        description="Defaults to INR for india, USD for international.",
+    )
+    active: bool = Field(default=True, description="Unset to hide this length from the site.")

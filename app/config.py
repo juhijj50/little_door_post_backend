@@ -20,8 +20,6 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     admin_token: str = ""
 
-    subscription_price_inr: int = 499
-    signup_window: str = "Automatic"
 
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
@@ -58,32 +56,6 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
-
-def signup_open(now: datetime | None = None) -> bool:
-    """Sign-ups run from the 20th of one month to the 2nd of the next."""
-    mode = get_settings().signup_window
-    if mode == "Open now":
-        return True
-    if mode == "Closed":
-        return False
-    day = (now or datetime.now()).day
-    return day >= 20 or day <= 2
-
-
-def current_cycle(now: datetime | None = None) -> str:
-    """The month a sign-up belongs to, as 'YYYY-MM'.
-
-    Sign-ups on the 1st or 2nd are closing out the window that opened on the
-    20th of the previous month, so they count against that month.
-    """
-    now = now or datetime.now()
-    year, month = now.year, now.month
-    if now.day <= 2:
-        month -= 1
-        if month == 0:
-            year, month = year - 1, 12
-    return f"{year}-{month:02d}"
 
 
 _ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I/O/0/1 to misread

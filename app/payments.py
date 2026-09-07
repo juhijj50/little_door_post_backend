@@ -38,14 +38,19 @@ def _client():
     return razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
 
 
-async def create_order(*, amount_inr: int, reference: str, notes: dict) -> str:
-    """Create a Razorpay order and return its id. Amounts are in paise."""
+async def create_order(*, amount_minor: int, currency: str, reference: str, notes: dict) -> str:
+    """Create a Razorpay order and return its id.
+
+    ``amount_minor`` is already in the currency's smallest unit — paise for INR,
+    cents for USD — which is exactly what Razorpay expects, so nothing is
+    multiplied or rounded on the way in.
+    """
     client = _client()
     order = await run_in_threadpool(
         client.order.create,
         {
-            "amount": amount_inr * 100,
-            "currency": "INR",
+            "amount": amount_minor,
+            "currency": currency,
             "receipt": reference,
             "notes": notes,
             "payment_capture": 1,

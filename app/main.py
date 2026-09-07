@@ -61,7 +61,14 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="The Little Door Post",
-    description="Sign-ups for a monthly envelope of letters, stickers, art prints and activity sheets.",
+    description=(
+        "Sign-ups for a monthly envelope of letters, stickers, art prints and "
+        "activity sheets.\n\n"
+        "**Money is always in minor units** — paise for INR, cents for USD. "
+        "`27900` is ₹279 and `1500` is $15. This is the unit Razorpay takes, so "
+        "amounts pass through unconverted; every `amount_minor` field follows it, "
+        "and each one is paired with an `amount_display` written for people."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -69,7 +76,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().origins,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["Content-Type", "X-Admin-Token"],
 )
 

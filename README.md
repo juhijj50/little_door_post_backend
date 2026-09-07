@@ -18,6 +18,30 @@ uvicorn app.main:app --reload --port 8000
 
 Interactive docs while it runs: <http://localhost:8000/docs>
 
+## Deploying to Render
+
+`render.yaml` in this folder is a Blueprint: **New > Blueprint** in the Render
+dashboard, point it at this repo, and it creates the service with the build and
+start commands, region, health check and environment already set. It stops to
+ask for the six values marked `sync: false` — the Neon URL, the admin token,
+your site's origin, and the three Razorpay keys (leave those blank for now).
+
+Doing it by hand instead? The settings that matter:
+
+| Setting | Value |
+| --- | --- |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
+| Health Check Path | `/api/health` |
+
+`--host 0.0.0.0` is not optional: the default `127.0.0.1` only accepts
+connections from inside the container, so Render cannot route to it. And leave
+`PORT` alone — Render sets it.
+
+On the free plan the service sleeps after 15 minutes idle and takes most of a
+minute to wake. The site covers for this by pinging `/api/config` as soon as
+any page loads, so the wake happens while the reader is still reading.
+
 ## Configuration
 
 Everything lives in `backend/.env` — see `.env.example` for the full list.
@@ -65,6 +89,125 @@ Switching it on is filling in two values and restarting. No code change.
 
 Admin routes want the token as an `X-Admin-Token` header, or `?token=` so a
 link opens in a browser.
+
+## What is and is not stored
+
+**Nothing is kept for readers outside India.** There is no shipping abroad yet,
+so the site says so and stops — no form, no request, no row. A direct POST with
+`region: "international"` is refused with a 400. Nothing is promised, so nothing
+needs keeping to honour it.
+
+**A sign-up that is never paid for does not survive the day.** A row does have to
+exist while checkout is in flight — Razorpay wants the order created before the
+customer pays, and if the address lived only in the browser, a tab that died
+mid-payment would leave money taken and nowhere to post to. So the row is
+written first and cleaned up after: anything still `pending` 24 hours later is
+discarded by `discard_abandoned()`, which rides the same hook as the monthly
+sweep.
+
+Two kinds of leftover, treated differently:
+
+* A **first-timer** who never paid is deleted outright — nothing is lost.
+* A **returning reader** who abandoned a renewal is kept and put back to
+  `expired`. Only the abandoned attempt is dropped; their paid history is not
+  ours to throw away.
+
+So in practice the only rows you ever see are `active` and `expired`.
+
+## Who is who
+
+A reader is identified by **first name + phone number**, both reduced to a
+stable key (`app/identity.py`) before anything is compared. The same person
+writes their own number five ways across five months — `+91 98765 43210`,
+`09876543210`, `98765-43210` — and all of them reduce to `9876543210`.
+
+That pairing is a unique index, so one reader is one row however often they
+come back. Two names on one number are two readers, which is how a household
+sharing a phone works.
+
+**Why the name as well as the phone.** The two mistakes are not equally bad.
+Phone alone can *merge* a parent and child on one number into a single record —
+one address, two people's payments tangled together. Adding the name can
+instead *split* one person in two if they sign up as "Bob" and later as
+"Robert". A split is a five-minute tidy-up; a wrong merge posts an envelope to
+the wrong house. The key errs towards splitting.
+
+**Signing up twice.** The rule is about whether letters are still owed:
+
+| Situation | What happens |
+| --- | --- |
+| Same name + phone, letters still to come | **Refused** — 409, naming how many are left, suggesting a different name for a housemate |
+| Same name + phone, unpaid attempt | Allowed — the attempt is updated, not duplicated |
+| Same name + phone, subscription run out | **Renewal** — the same row is reused, details refreshed |
+| Different name, same phone | A separate reader |
+
+Renewals **add**: two letters still owed plus three bought makes five. Assigning
+instead of adding would quietly swallow what they had already paid for.
+
+## How a subscription lives
+
+Three tables carry it.
+
+**`plans`** is the price list — one row per region and length, six in all. Amounts
+are integers in *minor units* (paise, cents), so nothing is ever a float and
+Razorpay gets exactly the number it wants. Change a price and only new sign-ups
+see it: a subscriber row records what was actually charged, and history must not
+be rewritten by a later price change.
+
+**`cycles`** is one row per delivery month, holding that month's sign-up window.
+Rows are created on demand from the default rule — the 15th to the 5th, in
+Indian time — and can then be edited. **Whatever the table says wins**, so
+`PUT /api/admin/cycles/2026-11` with different dates moves that one month and
+nothing else.
+
+**`subscribers`** carries `plan_months` (1, 3 or 6) and `deliveries_remaining`,
+a counter that starts at the plan length *when the payment clears*, not at
+sign-up — an unpaid row owes nothing and can never appear on a mailing list.
+
+Each month, one statement counts a delivery against everyone:
+
+```sql
+update subscribers set
+    deliveries_remaining = greatest(deliveries_remaining - 1, 0),
+    last_counted_cycle   = :cycle,
+    status = case when deliveries_remaining - 1 <= 0 then 'expired' else 'active' end
+where status = 'active'
+  and (last_counted_cycle is null or last_counted_cycle < :cycle)
+```
+
+3 becomes 2 becomes 1 becomes 0, and 0 expires. Being a single statement it is
+atomic — a dropped connection cannot leave half the list decremented — and
+`last_counted_cycle < :cycle` makes it idempotent, so running it twice for the
+same month is a no-op the second time.
+
+**When it runs matters.** A month is counted once the *next* window opens on the
+15th — not when its own window shuts on the 5th. The envelopes have not been
+posted on the 5th, and expiring a one-letter reader then would drop them off the
+mailing list before the letter they paid for was ever sent. Counting on the 15th
+leaves ten days to pack and post.
+
+That is what lets it run automatically without a scheduler: every request that
+resolves the current cycle sweeps any month now due (`cycles.sweep()`). Render's
+free plan has no cron, and a sleeping service would miss one anyway.
+`POST /api/admin/sweep` and `POST /api/admin/cycles/{cycle}/roll` do the same
+thing by hand — the latter for when you have posted early.
+
+**Where the housekeeping runs.** `cycles.sweep()` does both jobs — rolling over
+any month now due, and discarding abandoned sign-ups — and is called from six
+places: `GET /api/config` (so every page load triggers it), `POST /api/subscriptions`,
+`GET /api/admin/cycles`, `POST /api/admin/sweep`, and both mailing-list
+endpoints.
+
+The mailing-list ones matter most. They are read exactly when the site has been
+quietest — between windows, when no visitor has triggered anything — and they
+are what you print labels from. Sweeping there first is what stops a reader
+whose subscription has quietly run out from getting an envelope nobody paid for.
+
+**Expired, not deleted.** An expired subscription drops off every list
+immediately, but the row stays. A Razorpay chargeback can arrive months after
+the fact and that row is the evidence. `POST /api/admin/purge` really deletes,
+but it needs `?confirm=true`, refuses anything under 30 days old, and never
+touches an active or pending row.
 
 ## What gets stored
 
