@@ -502,7 +502,6 @@ async def create_reminder(body: ReminderIn) -> dict:
                 f"{month} reminder — @{body.instagram}",
                 f"@{body.instagram} asked to be told when sign-ups open.\n\n"
                 f"  Instagram : @{body.instagram}\n"
-                f"  Email     : {body.email or '(not given)'}\n"
                 f"  Waiting for: the {cycle['cycle']} envelope, window opens {opens}\n\n"
                 f"Message them on Instagram when it does.\n",
             )
