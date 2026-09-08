@@ -154,6 +154,51 @@ Two kinds of leftover, treated differently:
 
 So in practice the only rows you ever see are `active` and `expired`.
 
+## Reminders
+
+Somebody arriving between windows can leave an Instagram handle at
+`POST /api/reminders` and be nudged when sign-ups open. The request is always
+recorded; emailing you is layered on top.
+
+Three things stop it being a nuisance:
+
+* **One per handle per month.** A unique index on the folded handle and the
+  delivery month keeps the first request, so tapping the button again is a
+  friendly no-op rather than a second email.
+* **Three per hour per address** (`app/ratelimit.py`). A burst from one person
+  is cut off with a 429 and a `Retry-After`; everybody else is unaffected. The
+  counters are in memory, so a restart forgets them — fine for guarding an
+  inbox, and worth replacing with a shared store if this ever runs on more than
+  one instance. Sign-ups are limited too, at twenty an hour.
+* **Mail can never cost somebody their place.** The row is committed before the
+  send is attempted, and the send is wrapped, so a dead mailbox cannot turn a
+  request that already worked into an error.
+
+Subjects are titled by the delivery month — *"October reminder — @handle"* — so
+a season's worth sits together in the inbox.
+
+Read the waiting list at `GET /api/admin/reminders`, and mark one off with
+`POST /api/admin/reminders/{id}/done` once you have messaged them.
+
+### Turning the email on
+
+Requests are saved with or without this; these three only decide whether you
+are told by email as well.
+
+1. Gmail needs an **app password**, not your account password. Enable 2-Step
+   Verification, then Google Account > Security > 2-Step Verification >
+   App passwords, and generate one for "Mail".
+2. Put it in `backend/.env`:
+   ```
+   EMAIL_USER=you@gmail.com
+   EMAIL_PASSWORD=the-16-character-app-password
+   EMAIL_TO=you@gmail.com
+   ```
+3. Add the same three in Render > your service > Environment, and restart.
+
+`GET /api/admin/reminders` reports `emailSending`, so you can see at a glance
+whether it took.
+
 ## Who is who
 
 A reader is identified by **first name + phone number**, both reduced to a

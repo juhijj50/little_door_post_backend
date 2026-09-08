@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import cycles, identity, mail, payments, plans
+from .. import cycles, identity, mail, payments, plans, ratelimit
 from ..config import get_settings, make_reference
 from ..db import fetch_one
 from ..models import (
@@ -180,7 +181,17 @@ async def config() -> dict:
     }
 
 
-@router.post("/subscriptions", response_model=SubscribeResponse, status_code=201)
+@router.post(
+    "/subscriptions",
+    response_model=SubscribeResponse,
+    status_code=201,
+    dependencies=[
+        Depends(ratelimit.limit(
+            "signups", times=20, seconds=3600,
+            message="Too many sign-up attempts from here. Try again in an hour.",
+        ))
+    ],
+)
 async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
     # Nothing is posted outside India yet, so there is nothing to sell and
     # nothing worth keeping. The site says so and stops; this refuses a direct
@@ -445,7 +456,16 @@ async def razorpay_webhook(request: Request) -> dict:
 
 # ── reminders ───────────────────────────────────────────────────────────────
 
-@router.post("/reminders", status_code=201)
+@router.post(
+    "/reminders",
+    status_code=201,
+    dependencies=[
+        Depends(ratelimit.limit(
+            "reminders", times=3, seconds=3600,
+            message="That is enough reminders for now. Try again in an hour.",
+        ))
+    ],
+)
 async def create_reminder(body: ReminderIn) -> dict:
     """"Tell me when sign-ups open."
 
@@ -475,8 +495,11 @@ async def create_reminder(body: ReminderIn) -> dict:
         # already succeeded into an error for the reader.
         try:
             opens = cycle["opens_at"].astimezone(cycles.IST).strftime("%d %B %Y")
+            # "October reminder — @handle": the month the envelope goes out, so
+            # a season of these threads together in the inbox.
+            month = datetime.strptime(cycle["cycle"], "%Y-%m").strftime("%B")
             await mail.notify(
-                f"Reminder wanted: @{body.instagram}",
+                f"{month} reminder — @{body.instagram}",
                 f"@{body.instagram} asked to be told when sign-ups open.\n\n"
                 f"  Instagram : @{body.instagram}\n"
                 f"  Email     : {body.email or '(not given)'}\n"
