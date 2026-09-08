@@ -58,6 +58,16 @@ services:
       - key: CORS_ORIGINS
         sync: false
 
+      # Emails you when somebody asks for a reminder. Blank is fine — the
+      # request is saved regardless and readable at /api/admin/reminders.
+      # Gmail needs an app password, not the account password.
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASSWORD
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+
       # Leave all three blank until Razorpay approves the account. While they
       # are blank the API reports payments as unavailable, sign-ups are saved
       # as pending, and nothing can be charged.

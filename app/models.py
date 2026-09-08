@@ -224,3 +224,27 @@ class PlanIn(BaseModel):
         description="Defaults to INR for india, USD for international.",
     )
     active: bool = Field(default=True, description="Unset to hide this length from the site.")
+
+
+class ReminderIn(BaseModel):
+    """Somebody who arrived while the window was shut and wants telling when it
+    opens. The Instagram handle is where the nudge will go; an email is only
+    taken if they volunteer one."""
+
+    instagram: Str = Field(min_length=1, max_length=120)
+    email: EmailStr | None = None
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def blank_email(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("instagram")
+    @classmethod
+    def clean(cls, v: str) -> str:
+        """Same shapes the sign-up form accepts: @name, name, or a full URL."""
+        handle = re.sub(r"^https?://(www\.)?instagram\.com/", "", v, flags=re.I)
+        handle = re.split(r"[/?]", handle)[0].lstrip("@").strip()
+        if not handle or not HANDLE_RE.match(handle):
+            raise ValueError("That does not look like an Instagram handle")
+        return handle

@@ -14,7 +14,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from .. import cycles, plans
+from .. import cycles, mail, plans
 from ..config import get_settings
 from ..db import fetch_all, fetch_one
 from ..models import AdminStatusIn, CycleIn, PlanIn
@@ -195,6 +195,40 @@ async def list_payments(
         """
     )
     return {"totals": totals, "payments": rows}
+
+
+@router.get("/reminders")
+async def list_reminders(waiting: bool = True, limit: int = Query(default=200, ge=1, le=1000)) -> dict:
+    """People who asked to be told when sign-ups open.
+
+    `waiting=true` (the default) hides the ones already messaged, so the list is
+    a to-do rather than a history.
+    """
+    rows = await fetch_all(
+        """
+        select * from reminders
+        where (%s = false or notified_at is null)
+        order by created_at desc
+        limit %s
+        """,
+        (waiting, limit),
+    )
+    counts = await fetch_one(
+        "select count(*)::int as total, "
+        "count(*) filter (where notified_at is null)::int as waiting from reminders"
+    )
+    return {"counts": counts, "emailSending": mail.email_available(), "reminders": rows}
+
+
+@router.post("/reminders/{reminder_id}/done")
+async def reminder_done(reminder_id: str) -> dict:
+    """Mark one as messaged, so it drops off the waiting list."""
+    row = await fetch_one(
+        "update reminders set notified_at = now() where id = %s returning *", (reminder_id,)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="No such reminder.")
+    return {"reminder": row}
 
 
 # ── the months themselves ───────────────────────────────────────────────────

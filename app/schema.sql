@@ -5,6 +5,7 @@
 --   cycles       one row per delivery month, holding that month's sign-up window
 --   subscribers  ONE ROW PER READER, identified by first name + phone
 --   payments     one row per purchase, appended and never rewritten
+--   reminders    people who asked to be told when the next window opens
 
 create extension if not exists pgcrypto;
 
@@ -185,3 +186,26 @@ create index if not exists subscribers_due_idx
 create index if not exists subscribers_birthday_idx
     on subscribers (extract(month from birthdate), extract(day from birthdate))
     where birthdate is not null;
+
+
+-- ── reminders ───────────────────────────────────────────────────────────────
+-- Somebody who arrived while the window was shut and asked to be nudged when it
+-- opens. They give an Instagram handle; the reminder goes out as a DM by hand.
+--
+-- The unique index is the "once" in "set a reminder once": one request per
+-- handle per delivery month, so asking twice quietly changes nothing rather
+-- than filling the inbox.
+create table if not exists reminders (
+    id            uuid primary key default gen_random_uuid(),
+    instagram     text not null,              -- as typed, for replying to
+    instagram_key text not null,              -- folded, for the uniqueness rule
+    email         text,                       -- optional, if they left one
+    cycle         text not null,              -- the month they were waiting for
+    created_at    timestamptz not null default now(),
+    notified_at   timestamptz                 -- set once you have messaged them
+);
+
+create unique index if not exists reminders_once_idx
+    on reminders (instagram_key, cycle);
+create index if not exists reminders_waiting_idx
+    on reminders (created_at desc) where notified_at is null;

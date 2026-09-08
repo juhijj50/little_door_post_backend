@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     admin_token: str = ""
 
 
+    # Where a reminder request is sent. Gmail needs an app password, not the
+    # account password: Google Account > Security > 2-Step Verification >
+    # App passwords. Empty means reminders are still saved, just not emailed.
+    email_host: str = "smtp.gmail.com"
+    email_port: int = 587
+    email_user: str = ""
+    email_password: str = ""
+    email_to: str = ""
+
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
@@ -52,6 +61,11 @@ class Settings(BaseSettings):
         a CORS error, and the API log would look perfectly healthy.
         """
         return [o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def email_enabled(self) -> bool:
+        """Without all three there is nobody to send from, or to."""
+        return bool(self.email_user and self.email_password and (self.email_to or self.email_user))
 
     @property
     def payments_enabled(self) -> bool:

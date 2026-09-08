@@ -7,11 +7,12 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .. import cycles, identity, payments, plans
+from .. import cycles, identity, mail, payments, plans
 from ..config import get_settings, make_reference
 from ..db import fetch_one
 from ..models import (
     PaymentOut,
+    ReminderIn,
     RazorpayVerifyIn,
     SubscribeResponse,
     SubscriberIn,
@@ -440,3 +441,54 @@ async def razorpay_webhook(request: Request) -> dict:
         log.info("razorpay webhook: payment failed for order %s", order_id)
 
     return _ACK
+
+
+# ── reminders ───────────────────────────────────────────────────────────────
+
+@router.post("/reminders", status_code=201)
+async def create_reminder(body: ReminderIn) -> dict:
+    """"Tell me when sign-ups open."
+
+    Only offered while the window is shut — when it is open there is a form to
+    fill in instead, and a reminder would be a strange thing to ask for.
+
+    Asking twice is not an error. The unique index quietly keeps the first
+    request, so a reader who taps the button again gets the same friendly answer
+    rather than a complaint, and the inbox gets one message rather than five.
+    """
+    cycle = await cycles.current()
+
+    row = await fetch_one(
+        """
+        insert into reminders (instagram, instagram_key, email, cycle)
+        values (%s, %s, %s, %s)
+        on conflict (instagram_key, cycle) do update set instagram = excluded.instagram
+        returning *, (xmax = 0) as is_new
+        """,
+        (body.instagram, body.instagram.casefold(), body.email, cycle["cycle"]),
+    )
+
+    if row["is_new"]:
+        # The row is saved by this point, and it is the part that matters — the
+        # waiting list can be read in the admin whether or not the mail goes
+        # anywhere. So nothing about emailing is allowed to turn a request that
+        # already succeeded into an error for the reader.
+        try:
+            opens = cycle["opens_at"].astimezone(cycles.IST).strftime("%d %B %Y")
+            await mail.notify(
+                f"Reminder wanted: @{body.instagram}",
+                f"@{body.instagram} asked to be told when sign-ups open.\n\n"
+                f"  Instagram : @{body.instagram}\n"
+                f"  Email     : {body.email or '(not given)'}\n"
+                f"  Waiting for: the {cycle['cycle']} envelope, window opens {opens}\n\n"
+                f"Message them on Instagram when it does.\n",
+            )
+        except Exception:  # noqa: BLE001 — a mail problem is not the reader's
+            log.exception("reminder saved but could not be emailed: @%s", body.instagram)
+
+    return {
+        "ok": True,
+        "instagram": row["instagram"],
+        "cycle": row["cycle"],
+        "already_asked": not row["is_new"],
+    }
