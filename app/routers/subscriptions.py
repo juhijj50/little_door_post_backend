@@ -254,13 +254,17 @@ async def config() -> dict:
     ],
 )
 async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
-    # Nothing is posted outside India yet, so there is nothing to sell and
+    # Iris posts abroad, but no price is set for it — postage varies too much by
+    # country for one figure to cover it. So there is nothing to charge and
     # nothing worth keeping. The site says so and stops; this refuses a direct
     # POST too, so no row can be created by going round the form.
     if body.region == "international":
         raise HTTPException(
             status_code=400,
-            detail="The Little Door Post only ships within India at the moment.",
+            detail=(
+                "Postage outside India is worked out per country — "
+                "write to us on Instagram and Iris will sort it for you."
+            ),
         )
 
     await cycles.sweep()
