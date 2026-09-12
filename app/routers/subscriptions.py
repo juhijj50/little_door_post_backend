@@ -155,6 +155,41 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
         (credited["plan_months"], payment["subscriber_id"]),
     )
     log.info("%s paid for %d letters", row["reference"], credited["plan_months"])
+
+    # Told once, when the money actually clears — not when somebody starts a
+    # sign-up. Wrapped for the same reason the reminder is: the payment is
+    # banked and the row is written by now, so a dead mailbox must not turn a
+    # successful payment into an error for whoever just paid.
+    try:
+        letters = credited["plan_months"]
+        amount = plans.display(credited["amount_minor"], credited["currency"])
+        address = "\n".join(
+            "  " + line
+            for line in (
+                row["address_line1"],
+                row["address_line2"],
+                row["landmark"],
+                " ".join(filter(None, (row["city"], row["pincode"]))),
+                row["state"],
+            )
+            if line
+        )
+        await mail.notify(
+            f"Paid: {row['full_name']} — {amount}",
+            f"{row['full_name']} has paid for {letters} letter"
+            f"{'' if letters == 1 else 's'}.\n\n"
+            f"  Reference : {row['reference']}\n"
+            f"  Amount    : {amount}\n"
+            f"  Phone     : {row['phone']}\n"
+            f"  Instagram : @{row['instagram'] or '(none given)'}\n"
+            f"  Email     : {row['email']}\n"
+            f"  Starting  : the {credited['cycle']} envelope\n"
+            f"  Letters owed now: {row['deliveries_remaining']}\n\n"
+            f"Post to:\n{address}\n",
+        )
+    except Exception:  # noqa: BLE001 — a mail problem is not the payer's
+        log.exception("payment credited but could not be emailed: %s", row["reference"])
+
     return row
 
 
@@ -205,11 +240,11 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
     await cycles.sweep()
     cycle = await cycles.current()
 
-    if not cycle["open"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Sign-ups are closed just now. The next window opens on the 15th.",
-        )
+    # No window check. The site is only linked from the Instagram bio while
+    # sign-ups are running, so being able to reach this at all is the gate —
+    # which is also what lets the page render without waiting to be told.
+    # `cycle` is still needed: it is the delivery month a purchase buys into,
+    # and what the monthly roll-over counts against.
 
     plan = await plans.get(body.region, body.plan_months)
     if not plan:
