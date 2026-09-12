@@ -35,7 +35,9 @@ class SubscriberIn(BaseModel):
     plan_months: Literal[1, 3, 6] = 1
 
     first_name: Str = Field(min_length=1, max_length=60)
-    last_name: Str = Field(min_length=1, max_length=60)
+    # Optional: plenty of people go by one name, and the surname is never
+    # compared anyway — only the first name identifies a reader.
+    last_name: Str | None = Field(default=None, max_length=60)
     email: EmailStr
     # Split so the number itself is comparable however it is written. The code
     # is what varies between +91, 0091 and 91; the ten digits after it do not.
@@ -63,7 +65,8 @@ class SubscriberIn(BaseModel):
     pincode: Str | None = Field(default=None, max_length=24)
     country: Str | None = Field(default=None, max_length=120)
 
-    @field_validator("instagram", "interests_note", "address_line1", "address_line2",
+    @field_validator("last_name", "instagram", "interests_note",
+                     "address_line1", "address_line2",
                      "landmark", "city", "state", "pincode", "country",
                      "promo_code", "gift_message", mode="before")
     @classmethod
@@ -97,7 +100,7 @@ class SubscriberIn(BaseModel):
 
     @property
     def full_name(self) -> str:
-        return f"{self.first_name} {self.last_name}".strip()
+        return " ".join(filter(None, (self.first_name, self.last_name)))
 
     @property
     def phone(self) -> str:
