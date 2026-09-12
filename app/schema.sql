@@ -5,7 +5,7 @@
 --   cycles       one row per delivery month, holding that month's sign-up window
 --   subscribers  ONE ROW PER READER, identified by first name + phone
 --   payments     one row per purchase, appended and never rewritten
---   reminders    people who asked to be told when the next window opens
+--   founding     September's readers, who keep the founding rate for good
 
 create extension if not exists pgcrypto;
 
@@ -24,16 +24,33 @@ create table if not exists plans (
     primary key (region, months)
 );
 
--- Starting prices. `do nothing` on conflict, so re-running this migration never
--- overwrites a price you have changed since.
+-- `amount_minor` is the rate PER MONTH, not the total. One letter arrives each
+-- month, so a longer plan is a longer commitment at a better monthly rate —
+-- never a bundle of letters bought at once. The charge is rate × months.
+--
+-- `do nothing` on conflict, so re-running this migration never overwrites a
+-- price changed since. The update below is the deliberate exception: it resets
+-- India to the current rate card.
 insert into plans (region, months, currency, amount_minor) values
-    ('india',          1, 'INR',  27900),   -- ₹279
-    ('india',          3, 'INR',  79900),   -- ₹799
-    ('india',          6, 'INR', 149900),   -- ₹1499
-    ('international',  1, 'USD',   1500),   -- $15
-    ('international',  3, 'USD',   4200),   -- $42
-    ('international',  6, 'USD',   7900)    -- $79
+    ('india',          1, 'INR',  37000),   -- ₹370 a month
+    ('india',          3, 'INR',  33000),   -- ₹330 a month  → ₹990
+    ('india',          6, 'INR',  30000),   -- ₹300 a month  → ₹1800
+    ('international',  1, 'USD',   1500),   -- placeholder, to be set later
+    ('international',  3, 'USD',   1400),
+    ('international',  6, 'USD',   1300)
 on conflict (region, months) do nothing;
+
+update plans set amount_minor = v.rate, updated_at = now()
+  from (values (1, 37000), (3, 33000), (6, 30000)) as v(months, rate)
+ where plans.region = 'india' and plans.months = v.months
+   and plans.amount_minor <> v.rate;
+
+-- International is not sold yet and these are placeholders, but they are left
+-- descending so the rate card is never nonsense if it is ever shown.
+update plans set amount_minor = v.rate, active = false, updated_at = now()
+  from (values (1, 1500), (3, 1400), (6, 1300)) as v(months, rate)
+ where plans.region = 'international' and plans.months = v.months
+   and (plans.amount_minor <> v.rate or plans.active);
 
 
 -- ── cycles ──────────────────────────────────────────────────────────────────
@@ -187,25 +204,51 @@ create index if not exists subscribers_birthday_idx
     on subscribers (extract(month from birthdate), extract(day from birthdate))
     where birthdate is not null;
 
+drop table if exists reminders;
 
--- ── reminders ───────────────────────────────────────────────────────────────
--- Somebody who arrived while the window was shut and asked to be nudged when it
--- opens. They give an Instagram handle; the reminder goes out as a DM by hand.
---
--- The unique index is the "once" in "set a reminder once": one request per
--- handle per delivery month, so asking twice quietly changes nothing rather
--- than filling the inbox.
-create table if not exists reminders (
-    id            uuid primary key default gen_random_uuid(),
-    instagram     text not null,              -- as typed, for replying to
-    instagram_key text not null,              -- folded, for the uniqueness rule
-    email         text,                       -- optional, if they left one
-    cycle         text not null,              -- the month they were waiting for
-    created_at    timestamptz not null default now(),
-    notified_at   timestamptz                 -- set once you have messaged them
+
+-- ── founding members ────────────────────────────────────────────────────────
+-- September's readers, who keep the founding rate however short a plan they
+-- take. Matched on the phone number rather than the code alone: the code is
+-- shareable, a number is not, so quoting FOUNDING15 only works from the phone
+-- it belongs to.
+create table if not exists founding_members (
+    phone_key   text primary key,            -- normalised, as in app/identity.py
+    first_name  text not null,
+    last_name   text,
+    code        text not null default 'FOUNDING15',
+    rate_minor  integer not null default 30000,   -- ₹300 a month, any length
+    note        text,
+    created_at  timestamptz not null default now()
 );
 
-create unique index if not exists reminders_once_idx
-    on reminders (instagram_key, cycle);
-create index if not exists reminders_waiting_idx
-    on reminders (created_at desc) where notified_at is null;
+create index if not exists founding_code_idx on founding_members (code);
+
+
+-- ── the reader, in more pieces ──────────────────────────────────────────────
+-- A name split in two so the envelope can be addressed properly, and a phone
+-- split from its country code so the number is comparable across the ways
+-- people write it.
+alter table subscribers add column if not exists first_name   text;
+alter table subscribers add column if not exists last_name    text;
+alter table subscribers add column if not exists phone_cc     text default '+91';
+alter table subscribers add column if not exists phone_number text;
+
+update subscribers set
+    first_name = coalesce(first_name, split_part(btrim(full_name), ' ', 1)),
+    last_name  = coalesce(last_name,
+                          nullif(btrim(substr(btrim(full_name),
+                                 length(split_part(btrim(full_name), ' ', 1)) + 1)), ''))
+ where first_name is null;
+
+-- What they were charged per month, and under what code. Kept on the row so a
+-- later rate change never rewrites what somebody actually paid.
+alter table subscribers add column if not exists rate_minor  integer;
+alter table subscribers add column if not exists promo_code  text;
+
+-- A subscription bought for somebody else, and the note to tuck in with it.
+alter table subscribers add column if not exists is_gift      boolean not null default false;
+alter table subscribers add column if not exists gift_message text;
+
+alter table payments add column if not exists rate_minor integer;
+alter table payments add column if not exists promo_code text;

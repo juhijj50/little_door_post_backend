@@ -41,16 +41,23 @@ def phone_key(phone: str, region: str = "india") -> str:
     return digits.lstrip("0")
 
 
-def name_key(full_name: str) -> str:
+def name_key(name: str) -> str:
     """The first name, folded for comparison.
 
-        'Juhi Jani'  -> 'juhi'
-        '  juhi  J.' -> 'juhi'
+        'Juhi'             -> 'juhi'
+        'Juhi Jani'        -> 'juhi'
+        '  juhi  J.'       -> 'juhi'
+
+    Only the first name is ever compared. Surnames are the part people are
+    inconsistent about — given, dropped, spelt differently, or in the other
+    order — so "Shruti Ranjit Choudhary" and "Shruti Choudhary" have to come out
+    the same. Taking the first token means it makes no difference whether the
+    first name or the whole name is handed in.
     """
-    cleaned = re.sub(r"[^\w\s]", " ", full_name or "", flags=re.UNICODE)
+    cleaned = re.sub(r"[^\w\s]", " ", name or "", flags=re.UNICODE)
     parts = cleaned.split()
     return parts[0].casefold() if parts else ""
 
 
-def keys(full_name: str, phone: str, region: str = "india") -> tuple[str, str]:
-    return name_key(full_name), phone_key(phone, region)
+def keys(name: str, phone: str, region: str = "india") -> tuple[str, str]:
+    return name_key(name), phone_key(phone, region)

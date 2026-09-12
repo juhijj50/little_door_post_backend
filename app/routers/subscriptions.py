@@ -8,12 +8,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import cycles, identity, mail, payments, plans, ratelimit
+from .. import cycles, founding, identity, mail, payments, plans, ratelimit
 from ..config import get_settings, make_reference
 from ..db import fetch_one
 from ..models import (
     PaymentOut,
-    ReminderIn,
     RazorpayVerifyIn,
     SubscribeResponse,
     SubscriberIn,
@@ -50,6 +49,12 @@ def _out(row: dict) -> SubscriptionOut:
         amount_minor=amount,
         amount_display=plans.display(amount, currency) if amount and currency else None,
         deliveries_remaining=row.get("deliveries_remaining") or 0,
+        promo_code=row.get("promo_code"),
+        rate_minor=row.get("rate_minor"),
+        rate_display=(
+            plans.display(row["rate_minor"], currency)
+            if row.get("rate_minor") and currency else None
+        ),
     )
 
 
@@ -113,13 +118,13 @@ async def _payment_for(row: dict, payment: dict | None = None) -> PaymentOut:
 
 
 async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
-    """Mark one purchase paid and add the letters it bought.
+    """Mark one purchase paid and add the months it bought.
 
     Both the browser callback and the webhook come through here, so the two can
     never drift apart. `where status = 'pending'` is what makes it safe for both
     to arrive — and for either to be retried — because only the first one to
     land credits anything. Without that guard a reader who paid once could end
-    up owed six letters for a three-letter plan.
+    up owed six envelopes for a three-month plan.
     """
     credited = await fetch_one(
         """
@@ -139,9 +144,9 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
             "select * from subscribers where id = %s", (payment["subscriber_id"],)
         )
 
-    # Letters are *added*, never assigned. A reader with two still owed who buys
-    # three more ends up owed five; overwriting would quietly swallow the two
-    # they had already paid for.
+    # Months are *added*, never assigned. A reader with two envelopes still
+    # owed who buys three more ends up owed five; overwriting would quietly
+    # swallow the two they had already paid for.
     row = await fetch_one(
         """
         update subscribers set
@@ -154,15 +159,21 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
         """,
         (credited["plan_months"], payment["subscriber_id"]),
     )
-    log.info("%s paid for %d letters", row["reference"], credited["plan_months"])
+    log.info("%s paid for %d month(s)", row["reference"], credited["plan_months"])
 
     # Told once, when the money actually clears — not when somebody starts a
-    # sign-up. Wrapped for the same reason the reminder is: the payment is
-    # banked and the row is written by now, so a dead mailbox must not turn a
-    # successful payment into an error for whoever just paid.
+    # sign-up. Wrapped because the payment is banked and the row is written by
+    # now: a dead mailbox must not turn a successful payment into an error for
+    # whoever just paid.
     try:
-        letters = credited["plan_months"]
+        months = credited["plan_months"]
         amount = plans.display(credited["amount_minor"], credited["currency"])
+        rate = plans.display(
+            credited["rate_minor"] or credited["amount_minor"] // max(months, 1),
+            credited["currency"],
+        )
+        length = f"{months} month" + ("" if months == 1 else "s")
+
         address = "\n".join(
             "  " + line
             for line in (
@@ -174,17 +185,32 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
             )
             if line
         )
+
+        # Only shown when there is something to say, so the everyday email
+        # stays short enough to read on a phone at the post office.
+        extras = ""
+        if credited["promo_code"]:
+            extras += f"  Code      : {credited['promo_code']} ({rate} a month)\n"
+        if row["is_gift"]:
+            extras += "\nThis one is a gift. Copy onto the card:\n"
+            extras += "\n".join(
+                "  " + line for line in row["gift_message"].splitlines()
+            ) + "\n"
+
         await mail.notify(
             f"Paid: {row['full_name']} — {amount}",
-            f"{row['full_name']} has paid for {letters} letter"
-            f"{'' if letters == 1 else 's'}.\n\n"
+            f"{row['full_name']} has paid for {length}"
+            f"{'' if months == 1 else f' at {rate} a month'}"
+            f" — one envelope each month.\n\n"
             f"  Reference : {row['reference']}\n"
             f"  Amount    : {amount}\n"
             f"  Phone     : {row['phone']}\n"
             f"  Instagram : @{row['instagram'] or '(none given)'}\n"
             f"  Email     : {row['email']}\n"
             f"  Starting  : the {credited['cycle']} envelope\n"
-            f"  Letters owed now: {row['deliveries_remaining']}\n\n"
+            f"  Owed now  : {row['deliveries_remaining']} envelope"
+            f"{'' if row['deliveries_remaining'] == 1 else 's'}\n"
+            f"{extras}\n"
             f"Post to:\n{address}\n",
         )
     except Exception:  # noqa: BLE001 — a mail problem is not the payer's
@@ -257,12 +283,27 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
         )
 
     status = "pending"
-    amount = plan["amount_minor"]
+
+    # `plan["amount_minor"]` is the rate for ONE month. A longer plan is a
+    # longer commitment at a better monthly rate, not a bundle bought at once —
+    # one letter still arrives each month — so the charge is rate x months.
+    rate, applied_code, problem = await founding.rate_for(
+        phone=body.phone,
+        region=body.region,
+        code=body.promo_code,
+        standard_minor=plan["amount_minor"],
+    )
+    if problem:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": problem, "fields": {"promo_code": problem}},
+        )
+    amount = rate * body.plan_months
 
     # Who this is. First name plus phone, both reduced to a stable key, so the
     # same reader coming back next month lands on the row they already have
     # rather than a fresh one.
-    name_key, phone_key = identity.keys(body.full_name, body.phone, body.region)
+    name_key, phone_key = identity.keys(body.first_name, body.phone, body.region)
     reader = await fetch_one(
         "select * from subscribers where name_key = %s and phone_key = %s",
         (name_key, phone_key),
@@ -278,18 +319,25 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
             detail={
                 "error": (
                     f"{reader['full_name']} is already subscribed on this number — "
-                    f"{owed} letter{'' if owed == 1 else 's'} still to come. "
+                    f"{owed} envelope{'' if owed == 1 else 's'} still to come. "
                     "Signing up for somebody else in the house? Use their name."
                 ),
-                "fields": {"full_name": "This name and number are already subscribed"},
+                # Against the first name, because that is the field the form
+                # actually has — hanging it on `full_name` would point at an
+                # input that no longer exists, and the reader would see nothing.
+                "fields": {"first_name": "This name and number are already subscribed"},
             },
         )
 
     values = (
-        body.full_name, body.email, body.phone, body.instagram, body.birthdate,
-        body.interests, body.interests_note, body.address_line1, body.address_line2,
-        body.landmark, body.city, body.state, body.pincode, body.country or "India",
-        status, body.plan_months, plan["currency"], amount, cycle["cycle"],
+        body.full_name, body.first_name, body.last_name, body.email,
+        body.phone, body.phone_cc, body.phone_number,
+        body.instagram, body.birthdate, body.interests, body.interests_note,
+        body.address_line1, body.address_line2, body.landmark, body.city,
+        body.state, body.pincode, body.country or "India",
+        status, body.plan_months, plan["currency"], amount, rate, applied_code,
+        body.is_gift, body.gift_message if body.is_gift else None,
+        cycle["cycle"],
     )
 
     if reader:
@@ -300,12 +348,14 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
         row = await fetch_one(
             """
             update subscribers set
-                full_name = %s, email = %s, phone = %s, instagram = %s, birthdate = %s,
-                interests = %s, interests_note = %s, address_line1 = %s,
-                address_line2 = %s, landmark = %s, city = %s, state = %s,
-                pincode = %s, country = %s, status = %s, plan_months = %s,
-                currency = %s, amount_minor = %s, cycle = %s,
-                updated_at = now()
+                full_name = %s, first_name = %s, last_name = %s, email = %s,
+                phone = %s, phone_cc = %s, phone_number = %s,
+                instagram = %s, birthdate = %s, interests = %s, interests_note = %s,
+                address_line1 = %s, address_line2 = %s, landmark = %s, city = %s,
+                state = %s, pincode = %s, country = %s,
+                status = %s, plan_months = %s, currency = %s, amount_minor = %s,
+                rate_minor = %s, promo_code = %s, is_gift = %s, gift_message = %s,
+                cycle = %s, updated_at = now()
             where id = %s
             returning *
             """,
@@ -316,12 +366,17 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
             """
             insert into subscribers (
                 reference, region, name_key, phone_key,
-                full_name, email, phone, instagram, birthdate, interests,
-                interests_note, address_line1, address_line2, landmark, city,
-                state, pincode, country, status, plan_months, currency,
-                amount_minor, cycle, deliveries_remaining
+                full_name, first_name, last_name, email,
+                phone, phone_cc, phone_number,
+                instagram, birthdate, interests, interests_note,
+                address_line1, address_line2, landmark, city,
+                state, pincode, country,
+                status, plan_months, currency, amount_minor,
+                rate_minor, promo_code, is_gift, gift_message,
+                cycle, deliveries_remaining
             ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                      %s, %s, %s, %s, %s, %s, %s, %s, 0)
+                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                      %s, 0)
             returning *
             """,
             (make_reference(), body.region, name_key, phone_key, *values),
@@ -332,13 +387,19 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
     # rather than leaving abandoned rows behind. Paid rows are never touched.
     payment_row = await fetch_one(
         """
-        insert into payments (subscriber_id, cycle, plan_months, currency, amount_minor)
-        values (%s, %s, %s, %s, %s)
+        insert into payments (subscriber_id, cycle, plan_months, currency,
+                              amount_minor, rate_minor, promo_code)
+        values (%s, %s, %s, %s, %s, %s, %s)
         on conflict (subscriber_id, cycle) where status = 'pending'
         do update set
             plan_months = excluded.plan_months,
             currency = excluded.currency,
             amount_minor = excluded.amount_minor,
+            -- The rate and the code are kept on the purchase, not just on the
+            -- reader, so a later price change or a revoked code never rewrites
+            -- what somebody was actually charged.
+            rate_minor = excluded.rate_minor,
+            promo_code = excluded.promo_code,
             -- A Razorpay order's amount is fixed once created, so a change
             -- of plan has to start a new one.
             razorpay_order_id = case when payments.amount_minor
@@ -347,7 +408,8 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
             updated_at = now()
         returning *
         """,
-        (row["id"], cycle["cycle"], body.plan_months, plan["currency"], amount),
+        (row["id"], cycle["cycle"], body.plan_months, plan["currency"],
+         amount, rate, applied_code),
     )
 
     return SubscribeResponse(
@@ -487,65 +549,3 @@ async def razorpay_webhook(request: Request) -> dict:
         log.info("razorpay webhook: payment failed for order %s", order_id)
 
     return _ACK
-
-
-# ── reminders ───────────────────────────────────────────────────────────────
-
-@router.post(
-    "/reminders",
-    status_code=201,
-    dependencies=[
-        Depends(ratelimit.limit(
-            "reminders", times=3, seconds=3600,
-            message="That is enough reminders for now. Try again in an hour.",
-        ))
-    ],
-)
-async def create_reminder(body: ReminderIn) -> dict:
-    """"Tell me when sign-ups open."
-
-    Only offered while the window is shut — when it is open there is a form to
-    fill in instead, and a reminder would be a strange thing to ask for.
-
-    Asking twice is not an error. The unique index quietly keeps the first
-    request, so a reader who taps the button again gets the same friendly answer
-    rather than a complaint, and the inbox gets one message rather than five.
-    """
-    cycle = await cycles.current()
-
-    row = await fetch_one(
-        """
-        insert into reminders (instagram, instagram_key, email, cycle)
-        values (%s, %s, %s, %s)
-        on conflict (instagram_key, cycle) do update set instagram = excluded.instagram
-        returning *, (xmax = 0) as is_new
-        """,
-        (body.instagram, body.instagram.casefold(), body.email, cycle["cycle"]),
-    )
-
-    if row["is_new"]:
-        # The row is saved by this point, and it is the part that matters — the
-        # waiting list can be read in the admin whether or not the mail goes
-        # anywhere. So nothing about emailing is allowed to turn a request that
-        # already succeeded into an error for the reader.
-        try:
-            opens = cycle["opens_at"].astimezone(cycles.IST).strftime("%d %B %Y")
-            # "October reminder — @handle": the month the envelope goes out, so
-            # a season of these threads together in the inbox.
-            month = datetime.strptime(cycle["cycle"], "%Y-%m").strftime("%B")
-            await mail.notify(
-                f"{month} reminder — @{body.instagram}",
-                f"@{body.instagram} asked to be told when sign-ups open.\n\n"
-                f"  Instagram : @{body.instagram}\n"
-                f"  Waiting for: the {cycle['cycle']} envelope, window opens {opens}\n\n"
-                f"Message them on Instagram when it does.\n",
-            )
-        except Exception:  # noqa: BLE001 — a mail problem is not the reader's
-            log.exception("reminder saved but could not be emailed: @%s", body.instagram)
-
-    return {
-        "ok": True,
-        "instagram": row["instagram"],
-        "cycle": row["cycle"],
-        "already_asked": not row["is_new"],
-    }

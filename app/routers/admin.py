@@ -14,10 +14,10 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from .. import cycles, mail, plans
+from .. import cycles, identity, mail, plans
 from ..config import get_settings
 from ..db import fetch_all, fetch_one
-from ..models import AdminStatusIn, CycleIn, PlanIn
+from ..models import AdminStatusIn, CycleIn, FoundingMemberIn, PlanIn
 
 
 async def require_admin(request: Request, token: str | None = Query(default=None)) -> None:
@@ -197,38 +197,55 @@ async def list_payments(
     return {"totals": totals, "payments": rows}
 
 
-@router.get("/reminders")
-async def list_reminders(waiting: bool = True, limit: int = Query(default=200, ge=1, le=1000)) -> dict:
-    """People who asked to be told when sign-ups open.
+# ── founding members ────────────────────────────────────────────────────────
 
-    `waiting=true` (the default) hides the ones already messaged, so the list is
-    a to-do rather than a history.
+@router.get("/founding-members")
+async def list_founding() -> dict:
+    """September's readers and the rate each of them keeps."""
+    rows = await fetch_all("select * from founding_members order by first_name")
+    return {"count": len(rows), "members": rows}
+
+
+@router.post("/founding-members")
+async def add_founding(members: list[FoundingMemberIn]) -> dict:
+    """Add or update founding members, one or many at a time.
+
+    Keyed on the normalised phone number, so sending the same person twice
+    updates them rather than making a second record — which means you can paste
+    the whole September list again after a correction without thinking about it.
     """
-    rows = await fetch_all(
-        """
-        select * from reminders
-        where (%s = false or notified_at is null)
-        order by created_at desc
-        limit %s
-        """,
-        (waiting, limit),
-    )
-    counts = await fetch_one(
-        "select count(*)::int as total, "
-        "count(*) filter (where notified_at is null)::int as waiting from reminders"
-    )
-    return {"counts": counts, "emailSending": mail.email_available(), "reminders": rows}
+    saved = []
+    for m in members:
+        row = await fetch_one(
+            """
+            insert into founding_members
+                (phone_key, first_name, last_name, code, rate_minor, note)
+            values (%s, %s, %s, %s, %s, %s)
+            on conflict (phone_key) do update set
+                first_name = excluded.first_name,
+                last_name  = excluded.last_name,
+                code       = excluded.code,
+                rate_minor = excluded.rate_minor,
+                note       = excluded.note
+            returning *
+            """,
+            (
+                identity.phone_key(f"{m.phone_cc} {m.phone_number}"),
+                m.first_name, m.last_name, m.code, m.rate_minor, m.note,
+            ),
+        )
+        saved.append(row)
+    return {"saved": len(saved), "members": saved}
 
 
-@router.post("/reminders/{reminder_id}/done")
-async def reminder_done(reminder_id: str) -> dict:
-    """Mark one as messaged, so it drops off the waiting list."""
+@router.delete("/founding-members/{phone_key}")
+async def remove_founding(phone_key: str) -> dict:
     row = await fetch_one(
-        "update reminders set notified_at = now() where id = %s returning *", (reminder_id,)
+        "delete from founding_members where phone_key = %s returning *", (phone_key,)
     )
     if not row:
-        raise HTTPException(status_code=404, detail="No such reminder.")
-    return {"reminder": row}
+        raise HTTPException(status_code=404, detail="Nobody founding on that number.")
+    return {"removed": row}
 
 
 # ── the months themselves ───────────────────────────────────────────────────

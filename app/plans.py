@@ -24,15 +24,23 @@ def display(amount_minor: int, currency: str) -> str:
 
 
 def as_dict(row: dict) -> dict:
+    """One plan, as the page needs it.
+
+    `amount_minor` in the table is the rate for a SINGLE month. What somebody
+    actually pays is that rate times the number of months, so both figures are
+    sent: the total is what the button charges, and the rate is why a longer
+    plan is worth taking.
+    """
+    rate = row["amount_minor"]
+    months = row["months"]
+    total = rate * months
     return {
-        "months": row["months"],
+        "months": months,
         "currency": row["currency"],
-        "amountMinor": row["amount_minor"],
-        "amount": row["amount_minor"] / 100,
-        "display": display(row["amount_minor"], row["currency"]),
-        # What a month works out at on this plan — the reason to take the longer
-        # one, and worth showing next to it.
-        "perMonthDisplay": display(round(row["amount_minor"] / row["months"]), row["currency"]),
+        "rateMinor": rate,
+        "rateDisplay": display(rate, row["currency"]),
+        "totalMinor": total,
+        "totalDisplay": display(total, row["currency"]),
     }
 
 

@@ -34,10 +34,22 @@ class SubscriberIn(BaseModel):
     # the plans table, never from the request — a client cannot name its own.
     plan_months: Literal[1, 3, 6] = 1
 
-    full_name: Str = Field(min_length=1, max_length=120)
+    first_name: Str = Field(min_length=1, max_length=60)
+    last_name: Str = Field(min_length=1, max_length=60)
     email: EmailStr
-    phone: Str = Field(min_length=1, max_length=24)
+    # Split so the number itself is comparable however it is written. The code
+    # is what varies between +91, 0091 and 91; the ten digits after it do not.
+    phone_cc: Str = Field(default="+91", max_length=6)
+    phone_number: Str = Field(min_length=4, max_length=20)
     instagram: Str | None = Field(default=None, max_length=120)
+
+    # Quoted by September's readers. Checked against the phone, never honoured
+    # on its own — see the founding lookup in the router.
+    promo_code: Str | None = Field(default=None, max_length=32)
+
+    # A subscription bought for somebody else.
+    is_gift: bool = False
+    gift_message: Str | None = Field(default=None, max_length=600)
 
     birthdate: date | None = None
     interests: list[Str] = Field(default_factory=list, max_length=MAX_INTERESTS)
@@ -52,7 +64,8 @@ class SubscriberIn(BaseModel):
     country: Str | None = Field(default=None, max_length=120)
 
     @field_validator("instagram", "interests_note", "address_line1", "address_line2",
-                     "landmark", "city", "state", "pincode", "country", mode="before")
+                     "landmark", "city", "state", "pincode", "country",
+                     "promo_code", "gift_message", mode="before")
     @classmethod
     def blank_to_none(cls, v):
         """An untouched optional input arrives as "" — treat it as absent."""
@@ -60,12 +73,35 @@ class SubscriberIn(BaseModel):
             return None
         return v
 
-    @field_validator("phone")
+    @field_validator("phone_cc")
     @classmethod
-    def check_phone(cls, v: str) -> str:
-        if not PHONE_RE.match(v):
-            raise ValueError("That phone number does not look right")
+    def check_cc(cls, v: str) -> str:
+        v = v if v.startswith("+") else "+" + v.lstrip("0")
+        if not re.fullmatch(r"\+\d{1,4}", v):
+            raise ValueError("A country code looks like +91")
         return v
+
+    @field_validator("phone_number")
+    @classmethod
+    def check_number(cls, v: str) -> str:
+        digits = re.sub(r"\D", "", v)
+        if not 4 <= len(digits) <= 15:
+            raise ValueError("That phone number does not look right")
+        return digits
+
+    @field_validator("promo_code")
+    @classmethod
+    def upper_code(cls, v: str | None) -> str | None:
+        """Codes are shouted on Instagram; nobody types the case carefully."""
+        return v.upper().replace(" ", "") if v else None
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}".strip()
+
+    @property
+    def phone(self) -> str:
+        return f"{self.phone_cc} {self.phone_number}"
 
     @field_validator("instagram")
     @classmethod
@@ -124,6 +160,9 @@ class SubscriberIn(BaseModel):
         elif not self.country:
             problems["country"] = "Country is required"
 
+        if self.is_gift and not self.gift_message:
+            problems["gift_message"] = "Write a line to go in with the gift"
+
         if problems:
             raise ValueError(
                 FIELD_SEPARATOR.join(f"{k}: {v}" for k, v in problems.items())
@@ -137,6 +176,11 @@ class SubscriptionOut(BaseModel):
     region: str
     status: str
     full_name: str
+    promo_code: str | None = None
+    rate_minor: int | None = Field(
+        default=None, description="What one month cost them, in paise."
+    )
+    rate_display: str | None = None
     cycle: str
     plan_months: int
     currency: str | None = None
@@ -226,25 +270,18 @@ class PlanIn(BaseModel):
     active: bool = Field(default=True, description="Unset to hide this length from the site.")
 
 
-class ReminderIn(BaseModel):
-    """Somebody who arrived while the window was shut and wants telling when it
-    opens. The Instagram handle is where the nudge will go; an email is only
-    taken if they volunteer one."""
+class FoundingMemberIn(BaseModel):
+    """One of September's readers, who keeps the founding rate for good."""
 
-    instagram: Str = Field(min_length=1, max_length=120)
-    email: EmailStr | None = None
+    first_name: Str = Field(min_length=1, max_length=60)
+    last_name: Str | None = Field(default=None, max_length=60)
+    phone_cc: Str = Field(default="+91", max_length=6)
+    phone_number: Str = Field(min_length=4, max_length=20)
+    code: Str = Field(default="FOUNDING15", max_length=32)
+    rate_minor: int = Field(default=30000, gt=0, description="Per month, in paise.")
+    note: Str | None = Field(default=None, max_length=300)
 
-    @field_validator("email", mode="before")
+    @field_validator("code")
     @classmethod
-    def blank_email(cls, v):
-        return None if isinstance(v, str) and not v.strip() else v
-
-    @field_validator("instagram")
-    @classmethod
-    def clean(cls, v: str) -> str:
-        """Same shapes the sign-up form accepts: @name, name, or a full URL."""
-        handle = re.sub(r"^https?://(www\.)?instagram\.com/", "", v, flags=re.I)
-        handle = re.split(r"[/?]", handle)[0].lstrip("@").strip()
-        if not handle or not HANDLE_RE.match(handle):
-            raise ValueError("That does not look like an Instagram handle")
-        return handle
+    def upper(cls, v: str) -> str:
+        return v.upper().replace(" ", "")
