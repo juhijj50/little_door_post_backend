@@ -24,14 +24,17 @@ log = logging.getLogger("littledoorpost.subscriptions")
 router = APIRouter(prefix="/api", tags=["subscriptions"])
 
 # Everything a reader gets, in the order it sits in the envelope. Served from
-# here so the site and any receipt or email always list the same six things.
+# here so the site and any receipt or email always list the same eight things.
 ENVELOPE_CONTENTS = [
     "A letter from Iris about the place she has wandered into",
     "A letter from a side character she met there",
     "A sticker of that month's theme",
     "A sticker of one of the characters",
     "An art print from that month's story",
-    "A fun activity or fact sheet",
+    "An activity sheet — a puzzle, a recipe, or something to make",
+    "A fact sheet about something that town has lost — a tradition, a trade, "
+    "a word, a story nobody tells any more",
+    "A printed paper stamp of that month's town, for the Wanderland Passport",
 ]
 
 
