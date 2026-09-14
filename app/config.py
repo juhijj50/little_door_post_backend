@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     email_password: str = ""
     email_to: str = ""
 
+    # Brevo's HTTP API — the way to send from Render's free tier, which blocks
+    # outbound SMTP. Preferred over SMTP whenever it is set. The sender address
+    # has to be verified in Brevo first (Senders, Domains & Dedicated IPs >
+    # Senders); a plain Gmail address is fine and needs no domain.
+    brevo_api_key: str = ""
+    email_from: str = ""
+
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
@@ -61,6 +68,16 @@ class Settings(BaseSettings):
         a CORS error, and the API log would look perfectly healthy.
         """
         return [o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def notify_to(self) -> str:
+        """Where notifications go: EMAIL_TO, else the sending address."""
+        return self.email_to or self.email_from or self.email_user
+
+    @property
+    def notify_from(self) -> str:
+        """The verified sender Brevo sends as."""
+        return self.email_from or self.email_user or self.email_to
 
     @property
     def email_enabled(self) -> bool:

@@ -291,6 +291,33 @@ async def mark_international_notified(instagram_key: str) -> dict:
         raise HTTPException(status_code=404, detail="Nobody on the list by that handle.")
     return row
 
+@router.post("/test-email")
+async def test_email() -> dict:
+    """Send one test email and say plainly whether it went.
+
+    The way to check notifications on the live server. Every real notification
+    fires after a payment has already been saved, and swallows its own failure
+    so the payer is never shown an error for a mail problem — which also means
+    a broken mail setup is invisible until somebody wonders why they never
+    heard about an order. This makes it visible on demand.
+    """
+    how = mail.transport()
+    ok = await mail.notify(
+        "Test from The Little Door Post",
+        f"""This is a test sent from /api/admin/test-email.
+
+It went out via {how or 'nothing - email is not configured'}.
+If you are reading it, paid-order notifications will reach you too.
+""",
+    )
+    return {"sent": ok, **mail.last_result}
+
+
+@router.get("/email-status")
+async def email_status() -> dict:
+    """Which way email would go, and how the most recent send turned out."""
+    return {"transport": mail.transport(), "last": mail.last_result}
+
 @router.get("/cycles")
 async def list_cycles(limit: int = Query(default=24, ge=1, le=200)) -> dict:
     await cycles.sweep()
