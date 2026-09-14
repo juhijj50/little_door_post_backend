@@ -196,6 +196,59 @@ class SubscriptionOut(BaseModel):
     deliveries_remaining: int = 0
 
 
+
+class InternationalInterestIn(BaseModel):
+    """"Tell me when you post to my country."
+
+    Deliberately small. Posting abroad is not open — the export process is
+    still being set up — so asking for an address would be collecting something
+    we have no use for and no right to keep. A handle to reply to and a country
+    to count is the whole of it.
+    """
+
+    instagram: Str = Field(min_length=1, max_length=120)
+    country: Str = Field(min_length=2, max_length=60)
+    # Optional, and genuinely so. Instagram is how this club talks to people,
+    # but a message from an account you do not follow lands in a request folder
+    # nobody checks, so an email is offered as the surer way to be reached.
+    email: EmailStr | None = None
+
+    @field_validator("instagram")
+    @classmethod
+    def clean_handle(cls, v: str) -> str:
+        """Accept "@name", "name", or a full profile URL — store the handle.
+
+        Same rule as the sign-up form's, so one person is recognisable across
+        both lists however they happened to type it that day.
+        """
+        handle = re.sub(r"^https?://(www\.)?instagram\.com/", "", v, flags=re.I)
+        handle = re.split(r"[/?]", handle)[0].lstrip("@").strip()
+        if not handle:
+            raise ValueError("Instagram handle is required")
+        if not HANDLE_RE.match(handle):
+            raise ValueError("That Instagram handle has characters Instagram does not allow")
+        return handle
+
+    @field_validator("country")
+    @classmethod
+    def tidy_country(cls, v: str) -> str:
+        """Collapse the spacing and drop anything that is plainly not a place.
+
+        Not checked against a list of countries on purpose: the point is to
+        find out where readers actually are, and a list would quietly turn
+        somewhere we had not thought of into a validation error.
+        """
+        country = re.sub(r"\s+", " ", v).strip(" ,.")
+        if not country or not re.search(r"[A-Za-z]", country):
+            raise ValueError("Tell us which country you are in")
+        return country
+
+
+class InternationalInterestOut(BaseModel):
+    instagram: str
+    country: str
+    already_on_list: bool
+
 class PaymentOut(BaseModel):
     """What the sign-up form needs to open checkout.
 

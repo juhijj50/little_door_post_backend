@@ -12,6 +12,8 @@ from .. import cycles, founding, identity, mail, payments, plans, ratelimit
 from ..config import get_settings, make_reference
 from ..db import fetch_one
 from ..models import (
+    InternationalInterestIn,
+    InternationalInterestOut,
     PaymentOut,
     RazorpayVerifyIn,
     SubscribeResponse,
@@ -25,6 +27,11 @@ router = APIRouter(prefix="/api", tags=["subscriptions"])
 
 # Everything a reader gets, in the order it sits in the envelope. Served from
 # here so the site and any receipt or email always list the same eight things.
+#
+# Keep in step with `contents` in react-app/src/business.js and ENVELOPE in
+# react-app/src/TheLittleDoorPost.jsx. The Wanderland Passport is deliberately
+# NOT in this list: it goes out once, with a first envelope, so putting it here
+# would have every month's receipt promise one.
 ENVELOPE_CONTENTS = [
     "A letter from Iris about the place she has wandered into",
     "A letter from a side character she met there",
@@ -32,10 +39,16 @@ ENVELOPE_CONTENTS = [
     "A sticker of one of the characters",
     "An art print from that month's story",
     "An activity sheet — a puzzle, a recipe, or something to make",
-    "A fact sheet on what inspired that month's letter — the real place, "
-    "tradition or story behind it",
+    "A folded zine of that month's traditions, with a small keepsake tucked inside",
     "A printed paper stamp of that month's town, for the Wanderland Passport",
 ]
+
+# Sent once, with a first envelope only. Served separately from the list above
+# so the site can name it without claiming it arrives every month.
+FIRST_ENVELOPE_EXTRA = (
+    "A Wanderland Passport — a stapled booklet with a page for every door, "
+    "and somewhere to paste the stamp that comes with each letter"
+)
 
 
 def _out(row: dict) -> SubscriptionOut:
@@ -222,6 +235,88 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
     return row
 
 
+# The price a letter abroad will carry once the export process is set up. In
+# US dollars because that is what an international reader is quoted in, and
+# stated on the site next to the waiting list so nobody joins it expecting the
+# India price. Not in the `plans` table yet on purpose — nothing can be sold at
+# it until posting abroad actually opens.
+INTERNATIONAL_INDICATIVE_USD = 12
+
+
+@router.post(
+    "/international-interest",
+    response_model=InternationalInterestOut,
+    status_code=201,
+    dependencies=[
+        Depends(ratelimit.limit(
+            "international", times=20, seconds=3600,
+            message="Too many requests from here. Try again in an hour.",
+        ))
+    ],
+)
+async def register_international_interest(body: InternationalInterestIn) -> InternationalInterestOut:
+    """"Tell me when you post to my country."
+
+    Posting abroad is not open, so this sells nothing and takes no address. It
+    records a handle to reply to and a country to count, and emails so the list
+    can be acted on rather than merely accumulated.
+
+    Asking twice updates the one row instead of making a second: the handle,
+    folded to lower case, is the key. Somebody who signs up and forgets and
+    signs up again is one keen reader, not two.
+    """
+    key = body.instagram.casefold()
+
+    row = await fetch_one(
+        """
+        insert into international_interest (instagram_key, instagram, country, email)
+        values (%(key)s, %(instagram)s, %(country)s, %(email)s)
+        on conflict (instagram_key) do update set
+            instagram  = excluded.instagram,
+            country    = excluded.country,
+            -- A second sign-up without an email must not wipe one already
+            -- given; it is the only reliable way we have to reach them.
+            email      = coalesce(excluded.email, international_interest.email),
+            updated_at = now()
+        returning *, (xmax <> 0) as existed
+        """,
+        {
+            "key": key,
+            "instagram": body.instagram,
+            "country": body.country,
+            "email": body.email,
+        },
+    )
+
+    # Only worth an email the first time. A reader re-submitting the form
+    # should not ring the bell again.
+    if not row["existed"]:
+        try:
+            waiting = await fetch_one(
+                "select count(*) as n from international_interest where notified_at is null"
+            )
+            await mail.notify(
+                f"Abroad: @{row['instagram']} in {row['country']}",
+                f"""@{row['instagram']} would like the post in {row['country']}.
+
+  Instagram : @{row['instagram']}
+  Country   : {row['country']}
+  Email     : {row['email'] or '(none given)'}
+
+{waiting['n']} waiting to be told, in total.
+The whole list is at /api/admin/international-interest.
+""",
+            )
+        except Exception:  # noqa: BLE001 — their request is saved either way
+            log.exception("international interest saved but not emailed: %s", key)
+
+    return InternationalInterestOut(
+        instagram=row["instagram"],
+        country=row["country"],
+        already_on_list=bool(row["existed"]),
+    )
+
+
 @router.get("/config")
 async def config() -> dict:
     """Prices, the current window and payment availability, read at page load.
@@ -241,7 +336,9 @@ async def config() -> dict:
         "paymentsEnabled": payments.payments_available(),
         "paymentsMessage": None if payments.payments_available() else payments.PAYMENTS_PENDING_MESSAGE,
         "internationalOpen": False,
+        "internationalIndicativeUsd": INTERNATIONAL_INDICATIVE_USD,
         "contents": ENVELOPE_CONTENTS,
+        "firstEnvelopeExtra": FIRST_ENVELOPE_EXTRA,
     }
 
 

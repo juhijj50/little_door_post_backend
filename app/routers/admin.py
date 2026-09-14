@@ -250,6 +250,47 @@ async def remove_founding(phone_key: str) -> dict:
 
 # ── the months themselves ───────────────────────────────────────────────────
 
+@router.get("/international-interest")
+async def list_international_interest() -> dict:
+    """Who is waiting for the post to reach their country, and where they are.
+
+    `by_country` is the useful half. Opening a route is decided per country,
+    so the count per country is what says which one is worth the paperwork —
+    the individual rows are for writing back once it is done.
+    """
+    rows = await fetch_all(
+        "select * from international_interest order by created_at desc"
+    )
+    by_country: dict[str, int] = {}
+    for row in rows:
+        by_country[row["country"]] = by_country.get(row["country"], 0) + 1
+
+    return {
+        "total": len(rows),
+        "waiting": sum(1 for r in rows if r["notified_at"] is None),
+        "by_country": dict(
+            sorted(by_country.items(), key=lambda kv: (-kv[1], kv[0]))
+        ),
+        "interest": rows,
+    }
+
+
+@router.post("/international-interest/{instagram_key}/notified")
+async def mark_international_notified(instagram_key: str) -> dict:
+    """Mark one person as told, so the waiting count means something.
+
+    Set by hand because the telling is done by hand — a DM or an email from
+    Iris, not something the server sends.
+    """
+    row = await fetch_one(
+        "update international_interest set notified_at = now(), updated_at = now() "
+        "where instagram_key = %s returning *",
+        (instagram_key.casefold(),),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Nobody on the list by that handle.")
+    return row
+
 @router.get("/cycles")
 async def list_cycles(limit: int = Query(default=24, ge=1, le=200)) -> dict:
     await cycles.sweep()

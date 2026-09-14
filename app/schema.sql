@@ -32,16 +32,16 @@ create table if not exists plans (
 -- price changed since. The update below is the deliberate exception: it resets
 -- India to the current rate card.
 insert into plans (region, months, currency, amount_minor) values
-    ('india',          1, 'INR',  37000),   -- ₹370 a month
-    ('india',          3, 'INR',  33000),   -- ₹330 a month  → ₹990
-    ('india',          6, 'INR',  30000),   -- ₹300 a month  → ₹1800
+    ('india',          1, 'INR',  37500),   -- ₹375 a month
+    ('india',          3, 'INR',  34500),   -- ₹345 a month  → ₹1035
+    ('india',          6, 'INR',  31500),   -- ₹315 a month  → ₹1890
     ('international',  1, 'USD',   1500),   -- placeholder, to be set later
     ('international',  3, 'USD',   1400),
     ('international',  6, 'USD',   1300)
 on conflict (region, months) do nothing;
 
 update plans set amount_minor = v.rate, updated_at = now()
-  from (values (1, 37000), (3, 33000), (6, 30000)) as v(months, rate)
+  from (values (1, 37500), (3, 34500), (6, 31500)) as v(months, rate)
  where plans.region = 'india' and plans.months = v.months
    and plans.amount_minor <> v.rate;
 
@@ -217,10 +217,15 @@ create table if not exists founding_members (
     first_name  text not null,
     last_name   text,
     code        text not null default 'FOUNDING15',
-    rate_minor  integer not null default 30000,   -- ₹300 a month, any length
+    rate_minor  integer not null default 31500,   -- ₹315 a month, any length
     note        text,
     created_at  timestamptz not null default now()
 );
+
+-- The founding rate follows the six-month rate, which moved to ₹315 in
+-- September 2026. Only rows still sitting at the old ₹300 are touched, so
+-- re-running this is a no-op and a hand-set rate is never overwritten.
+update founding_members set rate_minor = 31500 where rate_minor = 30000;
 
 create index if not exists founding_code_idx on founding_members (code);
 
@@ -252,3 +257,31 @@ alter table subscribers add column if not exists gift_message text;
 
 alter table payments add column if not exists rate_minor integer;
 alter table payments add column if not exists promo_code text;
+
+
+-- ── international interest ──────────────────────────────────────────────────
+-- Readers outside India who want to be told when posting abroad opens.
+--
+-- Nothing is sold here and no address is taken: the export process is still
+-- being set up, so all this records is who asked and where they are, which is
+-- also what decides which countries are worth opening first.
+--
+-- `instagram_key` is the handle folded to lower case and is the primary key, so
+-- asking twice updates the one row rather than making a second. Somebody who
+-- signs up, forgets, and signs up again a week later is one person who is keen,
+-- not two people.
+create table if not exists international_interest (
+    instagram_key  text primary key,
+    instagram      text not null,            -- as they typed it
+    country        text not null,
+    email          text,
+    note           text,
+    created_at     timestamptz not null default now(),
+    updated_at     timestamptz not null default now(),
+    notified_at    timestamptz               -- set by hand once they are told
+);
+
+create index if not exists international_interest_country_idx
+    on international_interest (country);
+create index if not exists international_interest_waiting_idx
+    on international_interest (created_at) where notified_at is null;
