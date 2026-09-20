@@ -147,26 +147,26 @@ ABANDONED_AFTER = "24 hours"
 async def discard_abandoned() -> dict:
     """Clear out sign-ups that were started and never paid for.
 
-    A row has to exist while checkout is in flight — Razorpay wants the order
-    created before the customer pays, and if the address lived only in their
-    browser, a tab that died mid-payment would leave money taken and nowhere to
-    post to. So the row is written first and cleaned up after.
+    An attempt has to exist while checkout is in flight — Razorpay wants the
+    order created before the customer pays, and if the address lived only in
+    their browser, a tab that died mid-payment would leave money taken and
+    nowhere to post to. So it is written first and cleaned up after.
 
-    Two kinds of leftover, handled differently:
+    Nothing here touches `subscribers`. An attempt only ever becomes a
+    subscriber by being paid for, so an abandoned one is simply deleted and
+    nobody's history is at stake — which is what the old version had to be
+    careful about, back when unpaid sign-ups shared a table with paid ones.
 
-    * A **first-timer** who never paid is deleted outright. Nothing is lost.
-    * A **returning reader** who abandoned a renewal is *kept* — they have paid
-      before, and that ledger is not ours to throw away. Only the abandoned
-      attempt goes, and they are put back to 'expired' so they can try again.
+    An attempt with a *paid* payment against it is left alone: that is a
+    promotion caught mid-flight, not an abandonment.
     """
     gone = await fetch_all(
         f"""
-        delete from subscribers s
-        where s.status = 'pending'
-          and s.updated_at < now() - interval '{ABANDONED_AFTER}'
+        delete from signup_attempts a
+        where a.updated_at < now() - interval '{ABANDONED_AFTER}'
           and not exists (select 1 from payments p
-                          where p.subscriber_id = s.id and p.status = 'paid')
-        returning s.reference
+                          where p.attempt_id = a.id and p.status = 'paid')
+        returning a.reference
         """
     )
 
@@ -179,23 +179,10 @@ async def discard_abandoned() -> dict:
         """
     )
 
-    restored = await fetch_all(
-        f"""
-        update subscribers set status = 'expired', updated_at = now()
-        where status = 'pending'
-          and updated_at < now() - interval '{ABANDONED_AFTER}'
-        returning reference
-        """
-    )
-
-    if gone or restored:
-        log.info(
-            "discarded %d abandoned sign-ups, released %d returning readers",
-            len(gone), len(restored),
-        )
+    if gone:
+        log.info("discarded %d abandoned sign-ups", len(gone))
     return {
         "deleted": [r["reference"] for r in gone],
-        "released": [r["reference"] for r in restored],
         "attempts_dropped": len(dropped),
     }
 

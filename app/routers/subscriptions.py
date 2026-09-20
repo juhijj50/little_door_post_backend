@@ -51,13 +51,37 @@ FIRST_ENVELOPE_EXTRA = (
 )
 
 
+MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def month_name(cycle: str) -> str:
+    """'2026-10' -> 'October 2026'.
+
+    The cycle key is how the database files a month. It is not how anybody
+    reads one, and it was going out in the confirmation email as-is.
+    """
+    try:
+        year, month = (int(part) for part in str(cycle).split("-")[:2])
+        return f"{MONTH_NAMES[month - 1]} {year}"
+    except (ValueError, IndexError):
+        return str(cycle)
+
+
 def _out(row: dict) -> SubscriptionOut:
+    """One sign-up, as the site needs it — from either table.
+
+    An attempt has no `status` or `deliveries_remaining`: it is by definition
+    unpaid and owed nothing, which is exactly what those defaults say.
+    """
     amount, currency = row.get("amount_minor"), row.get("currency")
     return SubscriptionOut(
         id=str(row["id"]),
         reference=row["reference"],
         region=row["region"],
-        status=row["status"],
+        status=row.get("status") or "pending",
         full_name=row["full_name"],
         cycle=row["cycle"],
         plan_months=row.get("plan_months") or 1,
@@ -74,13 +98,26 @@ def _out(row: dict) -> SubscriptionOut:
     )
 
 
-async def _open_payment(subscriber_id) -> dict | None:
-    """The unpaid purchase a reader is partway through, if any."""
+async def _open_payment(attempt_id) -> dict | None:
+    """The unpaid purchase behind a sign-up attempt, if any."""
     return await fetch_one(
-        "select * from payments where subscriber_id = %s and status = 'pending' "
+        "select * from payments where attempt_id = %s and status = 'pending' "
         "order by created_at desc limit 1",
-        (subscriber_id,),
+        (attempt_id,),
     )
+
+
+async def _find_signup(signup_id: str) -> tuple[dict | None, bool]:
+    """A sign-up by id, whether it is still an attempt or already a subscriber.
+
+    The id the site holds is the attempt's while checkout is in flight, and the
+    subscriber's once it has been paid for — and the site may well ask again
+    after paying, so both have to answer. Returns (row, is_attempt).
+    """
+    attempt = await fetch_one("select * from signup_attempts where id = %s", (signup_id,))
+    if attempt:
+        return attempt, True
+    return await fetch_one("select * from subscribers where id = %s", (signup_id,)), False
 
 
 async def _payment_for(row: dict, payment: dict | None = None) -> PaymentOut:
@@ -133,6 +170,166 @@ async def _payment_for(row: dict, payment: dict | None = None) -> PaymentOut:
     )
 
 
+SUBSCRIBER_FIELDS = (
+    "full_name", "first_name", "last_name", "email",
+    "phone", "phone_cc", "phone_number",
+    "instagram", "birthdate", "interests", "interests_note",
+    "address_line1", "address_line2", "landmark", "city",
+    "state", "pincode", "country",
+    "plan_months", "currency", "rate_minor", "promo_code",
+    "is_gift", "gift_message", "cycle",
+)
+
+
+async def _promote(credited: dict) -> dict:
+    """Turn a paid attempt into a subscriber, and clear the attempt away.
+
+    This is the only place a row enters `subscribers`, which is what keeps that
+    table meaning one thing: people who have paid. An attempt that is never
+    paid for is swept up by cycles.discard_abandoned() and never appears there.
+
+    Months are *added*, never assigned. A reader with two envelopes still owed
+    who buys three more ends up owed five; overwriting would quietly swallow
+    the two they had already paid for.
+    """
+    attempt = await fetch_one(
+        "select * from signup_attempts where id = %s", (credited["attempt_id"],)
+    )
+
+    if attempt is None:
+        # Nothing to promote from. Either the webhook and the browser raced and
+        # the other one has already done this, or an attempt was swept while
+        # its payment was in flight. The subscriber the payment points at, if
+        # any, is the honest answer.
+        if credited.get("subscriber_id"):
+            return await fetch_one(
+                "select * from subscribers where id = %s", (credited["subscriber_id"],)
+            )
+        log.error(
+            "payment %s cleared but its attempt is gone and it has no subscriber",
+            credited["id"],
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Your payment went through, but we could not file it. "
+            "Please write to us with your reference and we will sort it at once.",
+        )
+
+    months = credited["plan_months"]
+    shared = [attempt[f] for f in SUBSCRIBER_FIELDS]
+
+    if attempt["subscriber_id"]:
+        # A reader who has subscribed before. Their details are refreshed —
+        # people move — and the envelopes they are owed go up by what they
+        # have just bought.
+        row = await fetch_one(
+            f"""
+            update subscribers set
+                {", ".join(f"{f} = %s" for f in SUBSCRIBER_FIELDS)},
+                amount_minor = %s,
+                status = 'active',
+                deliveries_remaining = deliveries_remaining + %s,
+                paid_at = coalesce(paid_at, now()),
+                updated_at = now()
+            where id = %s
+            returning *
+            """,
+            (*shared, credited["amount_minor"], months, attempt["subscriber_id"]),
+        )
+    else:
+        row = await fetch_one(
+            f"""
+            insert into subscribers (
+                reference, region, name_key, phone_key,
+                {", ".join(SUBSCRIBER_FIELDS)},
+                amount_minor, status, deliveries_remaining, paid_at
+            ) values ({", ".join(["%s"] * (4 + len(SUBSCRIBER_FIELDS)))},
+                      %s, 'active', %s, now())
+            returning *
+            """,
+            (
+                attempt["reference"], attempt["region"],
+                attempt["name_key"], attempt["phone_key"],
+                *shared, credited["amount_minor"], months,
+            ),
+        )
+
+    # Tie the payment to the reader it bought for, then let the attempt go.
+    await fetch_one(
+        "update payments set subscriber_id = %s, updated_at = now() "
+        "where id = %s returning id",
+        (row["id"], credited["id"]),
+    )
+    await fetch_one(
+        "delete from signup_attempts where id = %s returning id", (attempt["id"],)
+    )
+    return row
+
+
+async def _confirm_to_reader(row: dict, credited: dict) -> None:
+    """The receipt the reader gets, once the money has actually cleared.
+
+    Sent to them, not to Iris — the only email in the club that goes outward.
+    It has to work as a receipt (they may need it for a refund or a bank
+    query), so the reference, the amount and the payment id are all in it, but
+    it is written as a letter because that is what they have just bought.
+
+    Wrapped, like every other send here: the payment is banked and the row is
+    written by the time this runs, so a dead mailbox must not turn a successful
+    payment into an error for whoever just paid.
+    """
+    if not row.get("email"):
+        return
+
+    months = credited["plan_months"]
+    amount = plans.display(credited["amount_minor"], credited["currency"])
+    envelopes = "one envelope" if months == 1 else f"{months} envelopes, one a month"
+    contents = "\n".join(f"  - {item}" for item in ENVELOPE_CONTENTS)
+
+    try:
+        await mail.notify(
+            f"Your letters are on their way, {row['first_name']}",
+            f"""Dear {row['first_name']},
+
+Thank you - your subscription to The Little Door Post is confirmed, and Iris
+has your address.
+
+You have paid {amount} for {envelopes}, starting with the {month_name(row['cycle'])} post.
+Your first envelope goes out within ten days of the 5th, and should reach you
+within about a week of that.
+
+Inside every envelope:
+
+{contents}
+
+Your very first envelope also carries {FIRST_ENVELOPE_EXTRA[0].lower()}{FIRST_ENVELOPE_EXTRA[1:]}.
+
+Keep these somewhere safe:
+
+  Your reference : {row['reference']}
+  Payment id     : {credited.get('razorpay_payment_id') or '(pending)'}
+  Amount paid    : {amount}
+
+Quote the reference if you ever write to us - about a change of address, a
+letter that has not arrived, or anything at all.
+
+One thing worth saying plainly: this does not renew by itself. You have bought
+{envelopes} and nothing more; we cannot charge you again.
+
+Posting to: {row['address_line1'] or ''}, {row['city'] or ''} {row['pincode'] or ''}.
+If any of that is wrong, tell us before the 5th and we will fix it.
+
+With love, and a great deal of paper,
+Iris
+The Little Door Post
+{get_settings().email_to or ''}
+""",
+            to=row["email"],
+        )
+    except Exception:  # noqa: BLE001 — never the payer's problem
+        log.exception("could not send the confirmation to %s", row["reference"])
+
+
 async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
     """Mark one purchase paid and add the months it bought.
 
@@ -156,25 +353,31 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
     )
 
     if not credited:
-        return await fetch_one(
-            "select * from subscribers where id = %s", (payment["subscriber_id"],)
+        # Already credited by whichever of the browser or the webhook got here
+        # first. The subscriber exists by then, and the attempt is gone.
+        #
+        # Re-read the payment rather than trusting the one passed in: that dict
+        # was loaded while the row was still pending, so its subscriber_id is
+        # the null it had then, and looking a subscriber up by it finds nobody.
+        # The payer would be handed an empty confirmation for a payment that
+        # had in fact gone through perfectly.
+        settled = await fetch_one("select * from payments where id = %s", (payment["id"],))
+        if settled and settled["subscriber_id"]:
+            return await fetch_one(
+                "select * from subscribers where id = %s", (settled["subscriber_id"],)
+            )
+        log.error(
+            "payment %s is not pending but has no subscriber to show for it",
+            payment["id"],
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="That payment has already been recorded. If you cannot see your "
+            "subscription, write to us with your reference and we will sort it.",
         )
 
-    # Months are *added*, never assigned. A reader with two envelopes still
-    # owed who buys three more ends up owed five; overwriting would quietly
-    # swallow the two they had already paid for.
-    row = await fetch_one(
-        """
-        update subscribers set
-            status = 'active',
-            deliveries_remaining = deliveries_remaining + %s,
-            paid_at = coalesce(paid_at, now()),
-            updated_at = now()
-        where id = %s
-        returning *
-        """,
-        (credited["plan_months"], payment["subscriber_id"]),
-    )
+    row = await _promote(credited)
+    await _confirm_to_reader(row, credited)
     log.info("%s paid for %d month(s)", row["reference"], credited["plan_months"])
 
     # Told once, when the money actually clears — not when somebody starts a
@@ -386,8 +589,6 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
             },
         )
 
-    status = "pending"
-
     # `plan["amount_minor"]` is the rate for ONE month. A longer plan is a
     # longer commitment at a better monthly rate, not a bundle bought at once —
     # one letter still arrives each month — so the charge is rate x months.
@@ -433,68 +634,68 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
             },
         )
 
-    values = (
-        body.full_name, body.first_name, body.last_name, body.email,
-        body.phone, body.phone_cc, body.phone_number,
-        body.instagram, body.birthdate, body.interests, body.interests_note,
-        body.address_line1, body.address_line2, body.landmark, body.city,
-        body.state, body.pincode, body.country or "India",
-        status, body.plan_months, plan["currency"], amount, rate, applied_code,
-        body.is_gift, body.gift_message if body.is_gift else None,
-        cycle["cycle"],
+    # Nothing goes into `subscribers` here. An unpaid sign-up is an *attempt*,
+    # and lives in its own table until the money clears — so the subscriber
+    # list only ever holds people who have actually paid, and a returning
+    # reader's own row is not flipped to 'pending' while they renew.
+    #
+    # A returning reader keeps the reference they already have, so one person
+    # is not carrying two of them.
+    row = await fetch_one(
+        """
+        insert into signup_attempts (
+            reference, subscriber_id, region, cycle, name_key, phone_key,
+            full_name, first_name, last_name, email,
+            phone, phone_cc, phone_number,
+            instagram, birthdate, interests, interests_note,
+            address_line1, address_line2, landmark, city,
+            state, pincode, country,
+            plan_months, currency, amount_minor, rate_minor, promo_code,
+            is_gift, gift_message
+        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        on conflict (name_key, phone_key, cycle) do update set
+            subscriber_id = excluded.subscriber_id,
+            full_name = excluded.full_name, first_name = excluded.first_name,
+            last_name = excluded.last_name, email = excluded.email,
+            phone = excluded.phone, phone_cc = excluded.phone_cc,
+            phone_number = excluded.phone_number,
+            instagram = excluded.instagram, birthdate = excluded.birthdate,
+            interests = excluded.interests, interests_note = excluded.interests_note,
+            address_line1 = excluded.address_line1, address_line2 = excluded.address_line2,
+            landmark = excluded.landmark, city = excluded.city,
+            state = excluded.state, pincode = excluded.pincode,
+            country = excluded.country,
+            plan_months = excluded.plan_months, currency = excluded.currency,
+            amount_minor = excluded.amount_minor, rate_minor = excluded.rate_minor,
+            promo_code = excluded.promo_code,
+            is_gift = excluded.is_gift, gift_message = excluded.gift_message,
+            updated_at = now()
+        returning *
+        """,
+        (
+            (reader or {}).get("reference") or make_reference(),
+            (reader or {}).get("id"),
+            body.region, cycle["cycle"], name_key, phone_key,
+            body.full_name, body.first_name, body.last_name, body.email,
+            body.phone, body.phone_cc, body.phone_number,
+            body.instagram, body.birthdate, body.interests, body.interests_note,
+            body.address_line1, body.address_line2, body.landmark, body.city,
+            body.state, body.pincode, body.country or "India",
+            body.plan_months, plan["currency"], amount, rate, applied_code,
+            body.is_gift, body.gift_message if body.is_gift else None,
+        ),
     )
 
-    if reader:
-        # A returning reader whose last subscription has run out, or one coming
-        # back to finish an attempt they abandoned. Same row either way: their
-        # details are refreshed — people move — and the counter is left alone,
-        # because only a cleared payment adds envelopes.
-        row = await fetch_one(
-            """
-            update subscribers set
-                full_name = %s, first_name = %s, last_name = %s, email = %s,
-                phone = %s, phone_cc = %s, phone_number = %s,
-                instagram = %s, birthdate = %s, interests = %s, interests_note = %s,
-                address_line1 = %s, address_line2 = %s, landmark = %s, city = %s,
-                state = %s, pincode = %s, country = %s,
-                status = %s, plan_months = %s, currency = %s, amount_minor = %s,
-                rate_minor = %s, promo_code = %s, is_gift = %s, gift_message = %s,
-                cycle = %s, updated_at = now()
-            where id = %s
-            returning *
-            """,
-            (*values, reader["id"]),
-        )
-    else:
-        row = await fetch_one(
-            """
-            insert into subscribers (
-                reference, region, name_key, phone_key,
-                full_name, first_name, last_name, email,
-                phone, phone_cc, phone_number,
-                instagram, birthdate, interests, interests_note,
-                address_line1, address_line2, landmark, city,
-                state, pincode, country,
-                status, plan_months, currency, amount_minor,
-                rate_minor, promo_code, is_gift, gift_message,
-                cycle, deliveries_remaining
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                      %s, 0)
-            returning *
-            """,
-            (make_reference(), body.region, name_key, phone_key, *values),
-        )
-
-    # The purchase itself goes in the ledger. One open attempt per reader per
-    # month — the unique index sees to that — so retrying a sign-up updates it
-    # rather than leaving abandoned rows behind. Paid rows are never touched.
+    # The purchase itself goes in the ledger. One open payment per attempt —
+    # the unique index sees to that — so retrying a sign-up updates it rather
+    # than leaving abandoned rows behind. Paid rows are never touched.
     payment_row = await fetch_one(
         """
-        insert into payments (subscriber_id, cycle, plan_months, currency,
+        insert into payments (attempt_id, cycle, plan_months, currency,
                               amount_minor, rate_minor, promo_code)
         values (%s, %s, %s, %s, %s, %s, %s)
-        on conflict (subscriber_id, cycle) where status = 'pending'
+        on conflict (attempt_id) where status = 'pending'
         do update set
             plan_months = excluded.plan_months,
             currency = excluded.currency,
@@ -524,9 +725,12 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
 
 @router.get("/subscriptions/{subscription_id}", response_model=SubscribeResponse)
 async def get_subscription(subscription_id: str) -> SubscribeResponse:
-    row = await fetch_one("select * from subscribers where id = %s", (subscription_id,))
+    row, is_attempt = await _find_signup(subscription_id)
     if not row:
         raise HTTPException(status_code=404, detail="No such sign-up.")
+    if not is_attempt:
+        # Already paid for and promoted; there is no open payment to build.
+        return SubscribeResponse(subscription=_out(row), payment=None)
     return SubscribeResponse(
         subscription=_out(row),
         payment=await _payment_for(row),
@@ -536,10 +740,11 @@ async def get_subscription(subscription_id: str) -> SubscribeResponse:
 @router.post("/subscriptions/{subscription_id}/order", response_model=PaymentOut)
 async def create_order(subscription_id: str) -> PaymentOut:
     """Re-open checkout for a sign-up that was left unpaid."""
-    row = await fetch_one("select * from subscribers where id = %s", (subscription_id,))
+    row, is_attempt = await _find_signup(subscription_id)
     if not row:
         raise HTTPException(status_code=404, detail="No such sign-up.")
-    if row["status"] in ("active", "expired"):
+    if not is_attempt:
+        # It is in `subscribers`, which is only ever reached by paying.
         raise HTTPException(status_code=409, detail="This sign-up is already paid for.")
     return await _payment_for(row)
 
@@ -554,12 +759,17 @@ async def verify_payment(subscription_id: str, body: RazorpayVerifyIn) -> Subscr
     if not payments.payments_available():
         raise HTTPException(status_code=503, detail=payments.PAYMENTS_PENDING_MESSAGE)
 
-    row = await fetch_one("select * from subscribers where id = %s", (subscription_id,))
+    row, is_attempt = await _find_signup(subscription_id)
     if not row:
         raise HTTPException(status_code=404, detail="No such sign-up.")
 
+    # Keyed on whichever of the two this id turned out to be. After a webhook
+    # has already credited the payment, the attempt is gone and the id is the
+    # subscriber's — and _credit() below is idempotent, so a late browser
+    # callback lands harmlessly on the row that already exists.
+    column = "attempt_id" if is_attempt else "subscriber_id"
     payment = await fetch_one(
-        "select * from payments where subscriber_id = %s and razorpay_order_id = %s",
+        f"select * from payments where {column} = %s and razorpay_order_id = %s",
         (row["id"], body.razorpay_order_id),
     )
     if not payment:

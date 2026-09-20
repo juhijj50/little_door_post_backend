@@ -18,6 +18,41 @@ uvicorn app.main:app --reload --port 8000
 
 Interactive docs while it runs: <http://localhost:8000/docs>
 
+## Two tables, not one
+
+`subscribers` holds people who have **paid**, and nobody else. A sign-up that
+has not been paid for is an *attempt* and lives in `signup_attempts` until the
+money clears, at which point it is promoted and the attempt is deleted.
+
+The attempt has to exist before the payment: Razorpay wants an order created
+before the customer pays, and if the address lived only in the reader's
+browser, a tab that died mid-payment would leave money taken and nowhere to
+post to. What it must not do is sit in the subscriber list looking like a
+customer — which is what it used to do, as a row with `status = 'pending'`,
+and worse, a returning reader's own row was flipped to 'pending' while they
+renewed.
+
+`_promote()` in `app/routers/subscriptions.py` is the only place a row enters
+`subscribers`. An attempt nobody pays for is swept by
+`cycles.discard_abandoned()` after 24 hours and never appears there at all.
+
+A payment starts against `attempt_id` and gains its `subscriber_id` on
+promotion, so both columns are nullable and the admin ledger left-joins each.
+
+## Emails
+
+Two go out, both through `app/mail.py`:
+
+- **To Iris**, when a payment clears and when somebody abroad joins the waiting
+  list. No `to` argument; lands in the club inbox.
+- **To the reader**, once their payment clears — `_confirm_to_reader()`. This
+  is the only outward-facing email, and it doubles as their receipt: reference,
+  payment id and amount are all in it.
+
+Both are wrapped and non-fatal. By the time either runs the money is banked and
+the row is written, so a dead mailbox must never turn a successful payment into
+an error for whoever just paid. Check it with `POST /api/admin/test-email`.
+
 ## Deploying to Render
 
 `render.yaml` in this folder is a Blueprint: **New > Blueprint** in the Render

@@ -66,10 +66,12 @@ async def list_subscriptions(
         (status, status, cycle, cycle, search, search, search, search, limit),
     )
 
+    # No `pending` here any more: an unpaid sign-up is not a subscriber and
+    # lives in `signup_attempts` until it is paid for. `attempts` below is the
+    # number of sign-ups currently part way through.
     counts = await fetch_one(
         """
         select
-            count(*) filter (where status = 'pending')  ::int as pending,
             count(*) filter (where status = 'active')   ::int as active,
             count(*) filter (where status = 'expired')  ::int as expired,
             count(*) filter (where status = 'failed')   ::int as failed,
@@ -77,6 +79,12 @@ async def list_subscriptions(
         from subscribers
         """
     )
+    counts = {
+        **counts,
+        "attempts": (
+            await fetch_one("select count(*)::int as n from signup_attempts")
+        )["n"],
+    }
 
     current = await cycles.current()
     return {"cycle": current["cycle"], "counts": counts, "subscriptions": rows}
@@ -176,8 +184,19 @@ async def list_payments(
     """
     rows = await fetch_all(
         """
-        select p.*, s.reference, s.full_name, s.phone, s.email
-        from payments p join subscribers s on s.id = p.subscriber_id
+        -- Left joins, and the attempt as a fallback: a payment that has not
+        -- cleared yet has no subscriber, and an inner join would have dropped
+        -- it out of the ledger entirely — which is exactly the row you want to
+        -- see when somebody says a payment went missing.
+        select p.*,
+               coalesce(s.reference,  a.reference)  as reference,
+               coalesce(s.full_name,  a.full_name)  as full_name,
+               coalesce(s.phone,      a.phone)      as phone,
+               coalesce(s.email,      a.email)      as email,
+               (s.id is null) as unpaid_attempt
+        from payments p
+        left join subscribers s     on s.id = p.subscriber_id
+        left join signup_attempts a on a.id = p.attempt_id
         where (%s::uuid is null or p.subscriber_id = %s::uuid)
           and (%s::text is null or p.cycle = %s)
           and (%s::text is null or p.status = %s)

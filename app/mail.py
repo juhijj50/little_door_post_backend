@@ -61,12 +61,12 @@ def email_available() -> bool:
     return transport() is not None
 
 
-def _send_brevo(subject: str, body: str) -> None:
+def _send_brevo(subject: str, body: str, to: str | None = None) -> None:
     """Blocking send over HTTPS. Called through a worker thread."""
     settings = get_settings()
     payload = {
         "sender": {"email": settings.notify_from, "name": "The Little Door Post"},
-        "to": [{"email": settings.notify_to}],
+        "to": [{"email": to or settings.notify_to}],
         "subject": subject,
         "textContent": body,
     }
@@ -91,7 +91,7 @@ def _send_brevo(subject: str, body: str) -> None:
         raise RuntimeError(f"Brevo answered {exc.code}: {detail}") from None
 
 
-def _send_smtp(subject: str, body: str) -> None:
+def _send_smtp(subject: str, body: str, to: str | None = None) -> None:
     """Blocking send over SMTP. Called through a worker thread — SMTP is slow
     and would otherwise hold up the request that triggered it."""
     settings = get_settings()
@@ -99,7 +99,7 @@ def _send_smtp(subject: str, body: str) -> None:
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = settings.email_user
-    message["To"] = settings.email_to or settings.email_user
+    message["To"] = to or settings.email_to or settings.email_user
     message.set_content(body)
 
     with smtplib.SMTP(settings.email_host, settings.email_port, timeout=20) as smtp:
@@ -118,8 +118,13 @@ def _record(ok: bool, how: str | None, subject: str, error: str | None = None) -
     )
 
 
-async def notify(subject: str, body: str) -> bool:
-    """Send, and never let a mail problem break the request that caused it."""
+async def notify(subject: str, body: str, to: str | None = None) -> bool:
+    """Send, and never let a mail problem break the request that caused it.
+
+    `to` is for the one email that does not go to Iris: the confirmation a
+    reader gets after paying. Everything else leaves it out and lands in the
+    club's own inbox.
+    """
     how = transport()
     if how is None:
         log.error(
@@ -132,7 +137,7 @@ async def notify(subject: str, body: str) -> bool:
 
     sender = _send_brevo if how == "brevo" else _send_smtp
     try:
-        await run_in_threadpool(sender, subject, body)
+        await run_in_threadpool(sender, subject, body, to)
     except Exception as exc:  # noqa: BLE001 — any send failure is non-fatal here
         hint = ""
         if how == "smtp" and isinstance(exc, (OSError, TimeoutError)):
@@ -140,7 +145,10 @@ async def notify(subject: str, body: str) -> bool:
                 " — on Render's free tier outbound SMTP is blocked outright; "
                 "set BREVO_API_KEY to send over HTTPS instead"
             )
-        log.error("email NOT sent via %s: %r: %s%s", how, subject, exc, hint)
+        log.error(
+            "email NOT sent via %s to %s: %r: %s%s",
+            how, to or "the club inbox", subject, exc, hint,
+        )
         _record(False, how, subject, f"{exc}{hint}")
         return False
 

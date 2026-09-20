@@ -6,3 +6,8 @@ venv/
 .env.*
 !.env.example
 .pytest_cache/
+
+# Planning notes: next month's prices and who moves onto the founding
+# rate. Kept out of git deliberately — this repository is public, and the
+# file names individual subscribers.
+NEXT-MONTH-RATE-CHANGE.md

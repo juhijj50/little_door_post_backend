@@ -40,10 +40,25 @@ insert into plans (region, months, currency, amount_minor) values
     ('international',  6, 'USD',   1300)
 on conflict (region, months) do nothing;
 
-update plans set amount_minor = v.rate, updated_at = now()
-  from (values (1, 37500), (3, 34500), (6, 31500)) as v(months, rate)
+-- What is on sale in India, and at what rate. `active` is the switch the site
+-- reads: /api/config only lists active plans, and create_subscription refuses
+-- a plan that is not one, so an inactive row cannot be bought even by posting
+-- straight at the API.
+--
+-- 20 Sep 2026: only the single month is on sale. The three- and six-month
+-- plans are switched off while the rate card is reworked for next month. Their
+-- rates are left as they were, because the readers already on them are owed
+-- envelopes at the price they paid, and a rate nobody can buy does no harm.
+--
+-- Next month's card is written up in react-app/src/business.js under
+-- `nextRateCard`: 499 / 1380 / 2640 / 5040 for 1 / 3 / 6 / 12 months. The
+-- twelve-month row does not exist yet and the `months` check below has to gain
+-- a 12 before it can, along with ALLOWED_MONTHS in app/plans.py.
+update plans set amount_minor = v.rate, active = v.on_sale, updated_at = now()
+  from (values (1, 37500, true), (3, 34500, false), (6, 31500, false))
+       as v(months, rate, on_sale)
  where plans.region = 'india' and plans.months = v.months
-   and plans.amount_minor <> v.rate;
+   and (plans.amount_minor <> v.rate or plans.active <> v.on_sale);
 
 -- International is not sold yet and these are placeholders, but they are left
 -- descending so the rate card is never nonsense if it is ever shown.
@@ -186,8 +201,10 @@ create index if not exists payments_cycle_idx      on payments (cycle);
 create index if not exists payments_order_idx      on payments (razorpay_order_id);
 -- At most one unpaid attempt per reader per month, so retrying a sign-up
 -- updates that attempt instead of leaving a trail of abandoned ones.
-create unique index if not exists payments_open_attempt_idx
-    on payments (subscriber_id, cycle) where status = 'pending';
+--
+-- Superseded further down: an open payment now belongs to a signup_attempts
+-- row, because the subscriber does not exist until the money clears. Left here
+-- only so the history of this file reads straight; it is dropped below.
 
 create index if not exists subscribers_status_idx    on subscribers (status);
 create index if not exists subscribers_email_idx     on subscribers (lower(email));
@@ -285,3 +302,84 @@ create index if not exists international_interest_country_idx
     on international_interest (country);
 create index if not exists international_interest_waiting_idx
     on international_interest (created_at) where notified_at is null;
+
+
+-- ── signup attempts ─────────────────────────────────────────────────────────
+-- A sign-up that has not been paid for yet.
+--
+-- These used to be written straight into `subscribers` with status 'pending',
+-- which meant the subscriber list held people who had only ever opened the
+-- form — and, worse, a returning reader's own row was flipped to 'pending'
+-- while they were partway through renewing. `subscribers` now holds paid
+-- readers and nobody else.
+--
+-- The row still has to exist before the money moves, and that is not
+-- negotiable: Razorpay wants an order created before the customer pays, and if
+-- the address lived only in the reader's browser, a tab that died mid-payment
+-- would leave money taken and nowhere to post to. So the attempt is written
+-- here, and promoted into `subscribers` the moment a payment clears.
+--
+-- `subscriber_id` is set when the attempt belongs to a reader who has
+-- subscribed before, so the promotion knows to top up that row rather than
+-- start a second one for the same person.
+create table if not exists signup_attempts (
+    id                uuid primary key default gen_random_uuid(),
+    reference         text unique not null,     -- shown during checkout, kept on promotion
+    subscriber_id     uuid references subscribers (id) on delete cascade,
+
+    region            text not null check (region in ('india', 'international')),
+    cycle             text not null,
+    name_key          text not null,
+    phone_key         text not null,
+
+    full_name         text not null,
+    first_name        text not null,
+    last_name         text,
+    email             text not null,
+    phone             text not null,
+    phone_cc          text,
+    phone_number      text,
+    instagram         text,
+    birthdate         date,
+    interests         text[] not null default '{}',
+    interests_note    text,
+
+    address_line1     text,
+    address_line2     text,
+    landmark          text,
+    city              text,
+    state             text,
+    pincode           text,
+    country           text not null default 'India',
+
+    plan_months       smallint not null default 1,
+    currency          text not null default 'INR',
+    amount_minor      integer not null,
+    rate_minor        integer,
+    promo_code        text,
+    is_gift           boolean not null default false,
+    gift_message      text,
+
+    created_at        timestamptz not null default now(),
+    updated_at        timestamptz not null default now()
+);
+
+-- One open attempt per person per month. A reader who fills the form in twice
+-- updates the one attempt instead of leaving a trail of them.
+create unique index if not exists signup_attempts_person_idx
+    on signup_attempts (name_key, phone_key, cycle);
+create index if not exists signup_attempts_stale_idx on signup_attempts (updated_at);
+
+-- A payment now starts life against an attempt and gains its subscriber only
+-- when it clears, so the old NOT NULL no longer holds.
+alter table payments add column if not exists attempt_id uuid
+    references signup_attempts (id) on delete set null;
+alter table payments alter column subscriber_id drop not null;
+
+-- The old index keyed an open payment to a subscriber that no longer exists
+-- at that point. Dropped by name, and replaced by one keyed on the attempt.
+-- Note the name differs from the old one on purpose: reusing it would leave
+-- `create ... if not exists` silently keeping the old definition.
+drop index if exists payments_open_attempt_idx;
+create unique index if not exists payments_open_per_attempt_idx
+    on payments (attempt_id) where status = 'pending';
