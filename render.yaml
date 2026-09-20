@@ -15,8 +15,13 @@ services:
 
     # Keep this next to the database. Every request makes two or three round
     # trips to Neon, so sitting beside it beats sitting beside your readers.
-    # Neon is currently in us-west-2, which is Render's `oregon`. If you move
-    # the Neon project (Singapore is closer to India), move this to match.
+    #
+    # THESE NO LONGER MATCH. The Neon project is in ap-southeast-1 (Singapore)
+    # and this service is still in Oregon, so every one of those round trips
+    # crosses the Pacific and comes back. Render offers Singapore; moving to it
+    # would cut a good deal of latency off every sign-up — but Render cannot
+    # change a service's region in place, so it means recreating the service
+    # from this Blueprint and setting the variables again.
     region: oregon
 
     branch: main
@@ -58,9 +63,27 @@ services:
       - key: CORS_ORIGINS
         sync: false
 
-      # Emails you when somebody asks for a reminder. Blank is fine — the
-      # request is saved regardless and readable at /api/admin/reminders.
-      # Gmail needs an app password, not the account password.
+      # ── email ───────────────────────────────────────────────────────────
+      # Two go out: a note to Iris when a payment clears, and a confirmation
+      # to the reader who paid.
+      #
+      # BREVO_API_KEY is the one that matters HERE. Render's free tier blocks
+      # outbound SMTP (ports 25, 465, 587), so the Gmail settings below cannot
+      # send from this service however right the password is — the connection
+      # is refused before Gmail sees it. Brevo goes over HTTPS, which is not
+      # blocked, and is used in preference whenever it is set.
+      #
+      # The sender address must be verified in Brevo first: Senders, Domains &
+      # Dedicated IPs > Senders. A Gmail address is fine, no domain needed.
+      #
+      # Check it after a deploy:  POST /api/admin/test-email
+      - key: BREVO_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+
+      # The SMTP fallback. Works locally and on a paid instance; on the free
+      # plan it is blocked, so leave Brevo above doing the work.
       - key: EMAIL_USER
         sync: false
       - key: EMAIL_PASSWORD
