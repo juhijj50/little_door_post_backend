@@ -39,7 +39,7 @@ ENVELOPE_CONTENTS = [
     "A sticker of one of the characters",
     "An art print from that month's story",
     "An activity sheet — a puzzle, a recipe, or something to make",
-    "A folded zine of that month's traditions, with a small keepsake tucked inside",
+    "A special poem, written for that month by a friend of Iris",
     "A printed paper stamp of that month's town, for the Wanderland Passport",
 ]
 
