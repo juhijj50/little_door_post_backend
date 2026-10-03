@@ -408,14 +408,17 @@ async def set_site_image(slot: str, body: SiteImageIn) -> dict:
 
 @router.put("/theme")
 async def set_theme(body: ThemeIn) -> dict:
-    """Choose the palette for the buttons and/or the headings, by name."""
+    """Choose the colour of the buttons and/or the headings: a palette name,
+    or any colour as #rrggbb."""
     for key in design.KEYS:
         value = getattr(body, key)
         if value is None:
             continue
-        if value not in design.PALETTES:
-            raise HTTPException(status_code=422, detail=f"No palette called {value}.")
-        await design.set_value(key, value)
+        if not design.valid(value):
+            raise HTTPException(
+                status_code=422, detail=f"{value} is neither a palette nor a colour like #4f46e5."
+            )
+        await design.set_value(key, value.lower() if value.startswith("#") else value)
     return {"theme": await design.theme()}
 
 
