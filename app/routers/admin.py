@@ -14,6 +14,7 @@ Every route here except /login sits behind a signed-in session (see app/auth.py)
     GET    /subscriptions               look a reader up
     POST   /subscriptions/{id}/status   cancel or reinstate a reader
     PUT    /plans/{region}/{months}     change a price
+    PUT    /site-images/{slot}          the hero picture, or a section background
     POST   /media                       upload a photo
     DELETE /media/{id}                  delete a photo
 """
@@ -34,6 +35,7 @@ from ..models import (
     LoginIn,
     PasswordIn,
     PlanIn,
+    SiteImageIn,
 )
 
 STATUSES = ("pending", "active", "expired", "failed", "cancelled")
@@ -149,6 +151,7 @@ async def overview(request: Request) -> dict:
             for p in await fetch_all("select * from plans order by region, months")
         ],
         "gallery": await media.gallery(),
+        "site_images": await media.site_images(),
         "email": {"transport": mail.transport(), "last": mail.last_result},
     }
 
@@ -340,6 +343,44 @@ async def set_plan(region: str, months: int, body: PlanIn) -> dict:
 
 
 # ── photographs ─────────────────────────────────────────────────────────────
+
+@router.put("/site-images/{slot}")
+async def set_site_image(slot: str, body: SiteImageIn) -> dict:
+    """Set the picture for one slot — `hero` (the top of the page), `meet`
+    (behind Meet Iris) or `subscribe` (behind Receive a letter) — or clear it
+    with null to bring back the built-in one."""
+    if slot not in media.SLOTS:
+        raise HTTPException(status_code=404, detail="No such place on the site.")
+
+    image_id = None
+    if body.media_id:
+        image_id = media.parse_id(body.media_id)
+        found = await fetch_one(
+            "select id from media where id = %s and kind = 'site'", (image_id,)
+        )
+        if not found:
+            raise HTTPException(status_code=422, detail="That photo does not exist.")
+
+    previous = await fetch_one("select media_id from site_images where slot = %s", (slot,))
+    await fetch_one(
+        """
+        insert into site_images (slot, media_id) values (%s, %s)
+        on conflict (slot) do update set media_id = excluded.media_id, updated_at = now()
+        returning slot
+        """,
+        (slot, image_id),
+    )
+
+    # The picture it replaced is nobody's any more — clear it out.
+    old = (previous or {}).get("media_id")
+    if old and old != image_id:
+        await fetch_one(
+            "delete from media where id = %s and kind = 'site' "
+            "and not exists (select 1 from site_images where media_id = %s) returning id",
+            (old, old),
+        )
+    return {"slot": slot, "url": media.url(image_id)}
+
 
 @router.post("/media")
 async def upload(

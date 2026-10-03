@@ -554,3 +554,18 @@ begin
         insert into data_migrations (name) values ('backfill-deliveries');
     end if;
 end $$;
+
+
+-- ── site images: the hero, and the Meet Iris and Receive a letter backgrounds
+-- Set from the admin panel's "Site images" tab. A slot with no image (or no
+-- row) shows the site's built-in picture or colour. The photo itself lives in
+-- `media`, with kind 'site'.
+alter table media drop constraint if exists media_kind_check;
+alter table media add constraint media_kind_check
+    check (kind in ('gallery', 'envelope', 'site'));
+
+create table if not exists site_images (
+    slot        text primary key check (slot in ('hero', 'meet', 'subscribe')),
+    media_id    uuid references media (id) on delete set null,
+    updated_at  timestamptz not null default now()
+);

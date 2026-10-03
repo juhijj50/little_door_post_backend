@@ -345,6 +345,13 @@ class EditionContentsIn(BaseModel):
     envelope_media_id: str | None = None
 
 
+class SiteImageIn(BaseModel):
+    """The photo for one site slot — an id from an upload with kind=site — or
+    null to go back to the site's built-in picture."""
+
+    media_id: str | None = None
+
+
 class PlanIn(BaseModel):
     """Sets one price.
 

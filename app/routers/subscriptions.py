@@ -538,6 +538,9 @@ async def config() -> dict:
             {"id": g["id"], "url": g["url"], "caption": g["caption"]}
             for g in await media.gallery()
         ],
+        # The hero picture and the two section backgrounds, where the panel
+        # has set one; null means the site's built-in one.
+        "siteImages": await media.site_images(),
     }
 
 

@@ -24,7 +24,10 @@ MAX_BYTES = 5 * 1024 * 1024
 # database a gallery can take.
 MAX_GALLERY = 300
 
-KINDS = ("gallery", "envelope")
+KINDS = ("gallery", "envelope", "site")
+
+# The three places on the site whose picture is set from the panel.
+SLOTS = ("hero", "meet", "subscribe")
 
 
 def sniff(data: bytes) -> str | None:
@@ -112,6 +115,14 @@ async def gallery() -> list[dict]:
         }
         for r in rows
     ]
+
+
+async def site_images() -> dict[str, str | None]:
+    """The panel-set picture for each slot, or None where the built-in one
+    stands."""
+    rows = await fetch_all("select slot, media_id from site_images")
+    chosen = {r["slot"]: url(r["media_id"]) for r in rows}
+    return {slot: chosen.get(slot) for slot in SLOTS}
 
 
 router = APIRouter(prefix="/api", tags=["media"])
