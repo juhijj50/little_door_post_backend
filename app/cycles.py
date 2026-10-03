@@ -301,52 +301,39 @@ async def undo_edition(cycle: str) -> int:
 
 # The posting list for one edition: who that month's envelope goes to.
 #
-# Two kinds of reader:
+# No forecasting. A list exists only for an edition that is on sale or has
+# been posted:
 #
-#   Already counted for it — a row in `deliveries`. That keeps a past month's
+#   Counted for it already — a row in `deliveries`. That keeps a past month's
 #   list complete for good, longer plans included.
 #
-#   Not counted yet — worked out from the reader's run of months. Their next
-#   envelope is the month after the last one they were counted for (or the
-#   month they started with), and they get that month and the ones after it,
-#   one per envelope still owed. So a one-month October reader is on
-#   October's list and not November's, and a six-month October reader is on
-#   every list from October to March.
+#   The edition on sale now — also everyone with envelopes still owed. Opening
+#   an edition counts the one before it, so at that moment "still owed" is
+#   exactly who this edition goes to: a one-month October reader is at 0 by
+#   the time November opens; a six-month one still has five.
 #
-# Months are compared as numbers (year × 12 + month) so the run can cross a
-# new year. It assumes one edition a month; skip a month and the forecast for
-# the months after it runs one ahead until that month is counted.
-_MONTH_INDEX = "(split_part({c}, '-', 1)::int * 12 + split_part({c}, '-', 2)::int)"
+# An edition not open yet has no list until it is.
+COUNTED_SQL = """
+    exists (select 1 from deliveries d
+            where d.subscriber_id = s.id and d.cycle = %(cycle)s)
+    and s.status not in ('cancelled', 'failed')
+"""
 
-POSTING_LIST_SQL = f"""
-    select * from subscribers s
-    where (
-            exists (select 1 from deliveries d
+OWED_SQL = """
+    s.status = 'active' and s.deliveries_remaining > 0
+    and s.cycle <= %(cycle)s
+    and (s.last_counted_cycle is null or s.last_counted_cycle < %(cycle)s)
+    and not exists (select 1 from deliveries d
                     where d.subscriber_id = s.id and d.cycle = %(cycle)s)
-            and s.status not in ('cancelled', 'failed')
-          )
-       or (
-            s.status = 'active' and s.deliveries_remaining > 0
-            and not exists (select 1 from deliveries d
-                            where d.subscriber_id = s.id and d.cycle = %(cycle)s)
-            and %(index)s between
-                greatest({_MONTH_INDEX.format(c='s.cycle')},
-                         coalesce({_MONTH_INDEX.format(c='s.last_counted_cycle')} + 1, 0))
-            and greatest({_MONTH_INDEX.format(c='s.cycle')},
-                         coalesce({_MONTH_INDEX.format(c='s.last_counted_cycle')} + 1, 0))
-                + s.deliveries_remaining - 1
-          )
-    order by s.full_name
 """
 
 
-def month_index(cycle: str) -> int:
-    year, month = (int(p) for p in cycle.split("-"))
-    return year * 12 + month
-
-
 async def posting_list(cycle: str) -> list[dict]:
-    return await fetch_all(POSTING_LIST_SQL, {"cycle": cycle, "index": month_index(cycle)})
+    on_sale = (await current())["cycle"] == cycle
+    where = f"({COUNTED_SQL}) or ({OWED_SQL})" if on_sale else COUNTED_SQL
+    return await fetch_all(
+        f"select * from subscribers s where {where} order by s.full_name", {"cycle": cycle}
+    )
 
 
 # How long a half-finished sign-up is kept. Long enough that someone who pays

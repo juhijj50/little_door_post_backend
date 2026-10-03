@@ -97,7 +97,10 @@ def _cell_value(value):
     return value
 
 
-def _sheet(wb: Workbook, title: str, columns: list, rows: list[dict], first: bool) -> None:
+def _sheet(
+    wb: Workbook, title: str, columns: list, rows: list[dict], first: bool,
+    empty: str = "Nobody yet.",
+) -> None:
     ws = wb.active if first else wb.create_sheet()
     ws.title = title[:31]
 
@@ -123,7 +126,7 @@ def _sheet(wb: Workbook, title: str, columns: list, rows: list[dict], first: boo
     if rows:
         ws.auto_filter.ref = ws.dimensions
     else:
-        ws.cell(row=2, column=1, value="Nobody yet.")
+        ws.cell(row=2, column=1, value=empty)
 
 
 async def edition_workbook(cycle: str) -> bytes:
@@ -144,13 +147,18 @@ async def edition_workbook(cycle: str) -> bytes:
         (cycle,),
     )
     to_post = await cycles.posting_list(cycle)
+    current = (await cycles.current())["cycle"]
 
     # "To post" first: it is the sheet the envelopes are addressed from, and
-    # the one that opens when the file does. "Signed up" for a month nobody
-    # has bought into yet is empty, and opening on it read as a missing list.
+    # the one that opens when the file does.
     name = cycles.month_name(cycle)
+    empty = (
+        f"{name} is not on sale yet. This list fills in when it opens — "
+        "everyone with envelopes still to come is on it then."
+        if cycle > current else "Nobody yet."
+    )
     wb = Workbook()
-    _sheet(wb, f"To post {name}", TO_POST, to_post, first=True)
+    _sheet(wb, f"To post {name}", TO_POST, to_post, first=True, empty=empty)
     _sheet(wb, f"Signed up {name}", SIGNED_UP, signed_up, first=False)
 
     buffer = io.BytesIO()
