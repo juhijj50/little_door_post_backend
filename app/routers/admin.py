@@ -414,6 +414,9 @@ async def set_theme(body: ThemeIn) -> dict:
         value = getattr(body, key)
         if value is None:
             continue
+        if value == "" and key in design.FOLLOWS_BUTTONS:
+            await design.clear_value(key)
+            continue
         if not design.valid(value):
             raise HTTPException(
                 status_code=422, detail=f"{value} is neither a palette nor a colour like #4f46e5."

@@ -363,10 +363,14 @@ class SiteImageIn(BaseModel):
 
 
 class ThemeIn(BaseModel):
-    """The palettes for the buttons and the headings — send either or both."""
+    """The colours of the buttons, headings, form highlights and envelope
+    numbers — send any of them."""
 
     buttons: Str | None = Field(default=None, max_length=30)
     headings: Str | None = Field(default=None, max_length=30)
+    # "" puts these back to following the buttons' colour.
+    form: Str | None = Field(default=None, max_length=30)
+    numbers: Str | None = Field(default=None, max_length=30)
 
 
 class PlanIn(BaseModel):

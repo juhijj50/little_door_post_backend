@@ -19,7 +19,12 @@ PALETTES = (
     "plum", "rose", "terracotta", "ochre", "cocoa", "charcoal",
 )
 DEFAULT = "sage"
-KEYS = ("buttons", "headings")
+KEYS = ("buttons", "headings", "form", "numbers")
+
+# These two follow the buttons' colour until one is chosen for them — the
+# form's selected options and highlights, and the numbered circles in
+# "What's in the envelope". None means "same as the buttons".
+FOLLOWS_BUTTONS = ("form", "numbers")
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -32,7 +37,14 @@ def valid(value: str | None) -> bool:
 async def theme() -> dict[str, str]:
     rows = await fetch_all("select key, value from site_settings where key = any(%s)", (list(KEYS),))
     chosen = {r["key"]: r["value"] for r in rows}
-    return {k: chosen[k] if valid(chosen.get(k)) else DEFAULT for k in KEYS}
+    return {
+        k: chosen[k] if valid(chosen.get(k)) else (None if k in FOLLOWS_BUTTONS else DEFAULT)
+        for k in KEYS
+    }
+
+
+async def clear_value(key: str) -> None:
+    await fetch_one("delete from site_settings where key = %s returning key", (key,))
 
 
 async def set_value(key: str, value: str) -> None:
