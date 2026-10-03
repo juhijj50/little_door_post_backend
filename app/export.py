@@ -1,11 +1,11 @@
 """One edition's readers as an Excel workbook, for the admin panel's download.
 
-Two sheets:
+Two sheets, in this order:
 
-  Signed up   everyone whose payment for this edition cleared — who joined
-              that month, what they paid, and the notes they left
   To post     everyone this edition's envelope goes to, which also takes in
               readers on longer plans who signed up in an earlier month
+  Signed up   everyone whose payment for this edition cleared — who joined
+              that month, what they paid, and the notes they left
 
 Everything typed by a reader goes in as plain text. openpyxl stores any string
 starting with "=" as a formula, so a note written as "=HYPERLINK(...)" would
@@ -145,10 +145,13 @@ async def edition_workbook(cycle: str) -> bytes:
     )
     to_post = await cycles.posting_list(cycle)
 
+    # "To post" first: it is the sheet the envelopes are addressed from, and
+    # the one that opens when the file does. "Signed up" for a month nobody
+    # has bought into yet is empty, and opening on it read as a missing list.
     name = cycles.month_name(cycle)
     wb = Workbook()
-    _sheet(wb, f"Signed up {name}", SIGNED_UP, signed_up, first=True)
-    _sheet(wb, f"To post {name}", TO_POST, to_post, first=False)
+    _sheet(wb, f"To post {name}", TO_POST, to_post, first=True)
+    _sheet(wb, f"Signed up {name}", SIGNED_UP, signed_up, first=False)
 
     buffer = io.BytesIO()
     wb.save(buffer)
