@@ -523,3 +523,34 @@ begin
         insert into data_migrations (name) values ('2026-10-founding-rate');
     end if;
 end $$;
+
+
+-- ── deliveries: one row per reader per edition counted ──────────────────────
+-- The full history of who was counted for which edition. Before this, only
+-- the latest month was kept (`subscribers.last_counted_cycle`), so an older
+-- edition's posting list lost its longer-plan readers as soon as the next
+-- month was counted, and a mistaken "Open next month" could not be undone.
+--
+-- The primary key is the guard against counting anyone twice: one row per
+-- reader per edition, ever. Undoing an edition deletes its rows and gives the
+-- envelope back (see cycles.undo_edition).
+create table if not exists deliveries (
+    subscriber_id  uuid not null references subscribers (id) on delete cascade,
+    cycle          text not null,
+    counted_at     timestamptz not null default now(),
+    primary key (subscriber_id, cycle)
+);
+create index if not exists deliveries_cycle_idx on deliveries (cycle);
+
+-- What existed before this table: each reader's latest counted month. Earlier
+-- months were never recorded, so they cannot be recovered.
+do $$
+begin
+    if not exists (select 1 from data_migrations where name = 'backfill-deliveries') then
+        insert into deliveries (subscriber_id, cycle, counted_at)
+        select id, last_counted_cycle, updated_at from subscribers
+        where last_counted_cycle is not null
+        on conflict do nothing;
+        insert into data_migrations (name) values ('backfill-deliveries');
+    end if;
+end $$;

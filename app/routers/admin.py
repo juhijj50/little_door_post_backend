@@ -8,6 +8,7 @@ Every route here except /login sits behind a signed-in session (see app/auth.py)
     POST   /password                    change your password
     GET    /overview                    everything the dashboard shows
     PUT    /edition                     which edition is on sale; open or sold out
+    POST   /editions/{cycle}/undo       undo a mistaken "Open next month"
     PUT    /editions/{cycle}            what is in that edition's envelope
     GET    /editions/{cycle}/export     that edition's readers, as Excel
     GET    /subscriptions               look a reader up
@@ -117,11 +118,22 @@ async def overview(request: Request) -> dict:
         entry["revenue"].append(plans.display(s["revenue_minor"], s["currency"]))
 
     editions = await fetch_all("select * from cycles order by cycle desc limit 24")
+    posted = {
+        r["cycle"]: r["n"]
+        for r in await fetch_all("select cycle, count(*)::int as n from deliveries group by cycle")
+    }
+    latest = await cycles.last_counted()
     edition_list = []
     for row in editions:
         out = await _edition_out(row)
         stats = by_cycle.get(row["cycle"], {"signups": 0, "revenue": []})
-        edition_list.append({**out, **stats, "is_current": row["cycle"] == cycle})
+        edition_list.append({
+            **out, **stats,
+            "is_current": row["cycle"] == cycle,
+            # How many readers were counted for it — that edition's envelopes.
+            "posted_to": posted.get(row["cycle"], 0),
+            "can_undo": row["cycle"] == latest and row["cycle"] < cycle,
+        })
 
     return {
         "user": {"username": request.state.admin["username"]},
@@ -158,6 +170,30 @@ async def set_edition(body: EditionIn) -> dict:
     if body.cycle > before["cycle"]:
         counted[before["cycle"]] = await cycles.close_edition(before["cycle"])
     return {"edition": await _edition_out(row), "counted": counted}
+
+
+@router.post("/editions/{cycle}/undo")
+async def undo_count(cycle: str) -> dict:
+    """Undo a mistaken "Open next month": give every reader counted for this
+    edition their envelope back, and put this edition back on the site.
+
+    Only the most recent counted edition, and only once the site has moved
+    past it — undoing an older month would leave the newer counts on top of
+    a history that no longer matches them.
+    """
+    if not cycles.valid_cycle(cycle):
+        raise HTTPException(status_code=422, detail="An edition is written YYYY-MM.")
+    current = await cycles.current()
+    latest = await cycles.last_counted()
+    if latest != cycle or cycle >= current["cycle"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Only the most recently counted edition can be undone, "
+            "and only while a later edition is on the site.",
+        )
+    given_back = await cycles.undo_edition(cycle)
+    row = await cycles.get(cycle)
+    return {"edition": await _edition_out(row), "given_back": given_back}
 
 
 @router.put("/editions/{cycle}")

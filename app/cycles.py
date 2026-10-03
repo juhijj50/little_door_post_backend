@@ -179,22 +179,37 @@ async def roll_over(cycle: str) -> int:
     One statement, so it either applies to everyone or to no one — a connection
     dropped halfway cannot leave half the list decremented.
 
-    It is also idempotent. `last_counted_cycle < cycle` excludes anyone already
-    counted for this month, so running it twice is a no-op the second time.
+    It is also idempotent: each reader counted gets a row in `deliveries`, and
+    a reader who already has one for this month is skipped — so running it
+    twice is a no-op the second time. (`last_counted_cycle < cycle` stays as a
+    second guard: never count a month older than one already counted.)
 
     Returns how many subscriptions it touched.
     """
     rows = await fetch_all(
         """
-        update subscribers set
-            deliveries_remaining = greatest(deliveries_remaining - 1, 0),
-            last_counted_cycle   = %(cycle)s,
-            status = case when deliveries_remaining - 1 <= 0 then 'expired' else 'active' end,
-            updated_at = now()
-        where status = 'active'
-          and cycle <= %(cycle)s
-          and (last_counted_cycle is null or last_counted_cycle < %(cycle)s)
-        returning reference, status, deliveries_remaining
+        with counted as (
+            update subscribers s set
+                deliveries_remaining = greatest(deliveries_remaining - 1, 0),
+                last_counted_cycle   = %(cycle)s,
+                status = case when deliveries_remaining - 1 <= 0 then 'expired' else 'active' end,
+                updated_at = now()
+            where s.status = 'active'
+              and s.cycle <= %(cycle)s
+              and (s.last_counted_cycle is null or s.last_counted_cycle < %(cycle)s)
+              and not exists (select 1 from deliveries d
+                              where d.subscriber_id = s.id and d.cycle = %(cycle)s)
+            returning s.id, s.reference, s.status, s.deliveries_remaining
+        ),
+        logged as (
+            insert into deliveries (subscriber_id, cycle)
+            select id, %(cycle)s from counted
+            on conflict do nothing
+            returning subscriber_id
+        )
+        select c.reference, c.status, c.deliveries_remaining,
+               (select count(*) from logged) as logged
+        from counted c
         """,
         {"cycle": cycle},
     )
@@ -217,6 +232,7 @@ async def close_edition(cycle: str) -> int:
     in routers/subscriptions.py).
 
     Safe to repeat: roll_over() skips anyone already counted for the month.
+    Reversible: undo_edition() gives the envelopes back.
     """
     counted = await roll_over(cycle)
     await fetch_one(
@@ -227,20 +243,79 @@ async def close_edition(cycle: str) -> int:
     return counted
 
 
+async def last_counted() -> str | None:
+    """The most recent edition anybody was counted for — the one Undo works on."""
+    row = await fetch_one("select max(cycle) as cycle from deliveries")
+    return row["cycle"] if row else None
+
+
+async def undo_edition(cycle: str) -> int:
+    """Take back the count of one edition: every reader counted for it gets
+    that envelope back, and the edition goes back on the site as it was.
+
+    For a mistaken "Open next month". Only the most recent counted edition can
+    be undone (the admin route checks), so the history underneath stays
+    straight. A cancelled reader stays cancelled; an expired one is active
+    again, since they are owed that envelope once more.
+
+    Returns how many readers it gave an envelope back to.
+    """
+    rows = await fetch_all(
+        """
+        with removed as (
+            delete from deliveries where cycle = %(cycle)s returning subscriber_id
+        )
+        update subscribers s set
+            deliveries_remaining = case when s.status = 'cancelled'
+                                        then s.deliveries_remaining
+                                        else s.deliveries_remaining + 1 end,
+            status = case when s.status = 'expired' then 'active' else s.status end,
+            -- The latest month still on record for them, now that this one
+            -- is not. The delete above is not visible inside this statement,
+            -- hence the explicit `<>`.
+            last_counted_cycle = (select max(d.cycle) from deliveries d
+                                  where d.subscriber_id = s.id and d.cycle <> %(cycle)s),
+            updated_at = now()
+        from removed r
+        where s.id = r.subscriber_id
+        returning s.reference
+        """,
+        {"cycle": cycle},
+    )
+    await fetch_one(
+        "update cycles set rolled_over_at = null, updated_at = now() "
+        "where cycle = %s returning cycle",
+        (cycle,),
+    )
+    await fetch_one(
+        """
+        insert into current_edition (singleton, cycle) values (true, %s)
+        on conflict (singleton) do update set cycle = excluded.cycle, updated_at = now()
+        returning cycle
+        """,
+        (cycle,),
+    )
+    log.info("edition %s: count undone for %d readers", cycle, len(rows))
+    return len(rows)
+
+
 # The posting list for one edition: who that month's envelope goes to.
 #
-# Two kinds of reader. Before the edition is counted, everybody still owed an
-# envelope whose subscription has started by then. After it is counted, the
-# ones who were counted *for* it — which is what keeps the list right while the
-# envelopes are still being packed, after the panel has already moved on to
-# the next month.
+# Two kinds of reader. Anyone recorded in `deliveries` for this edition — which
+# keeps a past month's list complete for good, longer plans included. And,
+# before the edition is counted, everybody still owed an envelope whose
+# subscription has started by then.
 POSTING_LIST_SQL = """
     select * from subscribers s
     where s.cycle <= %(cycle)s
       and (
-            (s.last_counted_cycle = %(cycle)s and s.status not in ('cancelled', 'failed'))
+            (exists (select 1 from deliveries d
+                     where d.subscriber_id = s.id and d.cycle = %(cycle)s)
+             and s.status not in ('cancelled', 'failed'))
          or (s.status = 'active' and s.deliveries_remaining > 0
-             and (s.last_counted_cycle is null or s.last_counted_cycle < %(cycle)s))
+             and (s.last_counted_cycle is null or s.last_counted_cycle < %(cycle)s)
+             and not exists (select 1 from deliveries d
+                             where d.subscriber_id = s.id and d.cycle = %(cycle)s))
       )
     order by s.full_name
 """
