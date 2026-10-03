@@ -346,10 +346,27 @@ class EditionContentsIn(BaseModel):
 
 
 class SiteImageIn(BaseModel):
-    """The photo for one site slot — an id from an upload with kind=site — or
-    null to go back to the site's built-in picture."""
+    """Change one site slot. Send only what is changing:
+
+    - `media_id`: an id from an upload with kind=site, or null to go back to
+      the site's built-in picture;
+    - `text_tone`: the colour of the words over the picture — "light" (white)
+      or "dark" (black).
+    """
 
     media_id: str | None = None
+    text_tone: Literal["light", "dark"] | None = None
+    # Framing: the point kept in view (% across, % down) and the zoom.
+    pos_x: int | None = Field(default=None, ge=0, le=100)
+    pos_y: int | None = Field(default=None, ge=0, le=100)
+    zoom: int | None = Field(default=None, ge=100, le=300)
+
+
+class ThemeIn(BaseModel):
+    """The palettes for the buttons and the headings — send either or both."""
+
+    buttons: Str | None = Field(default=None, max_length=30)
+    headings: Str | None = Field(default=None, max_length=30)
 
 
 class PlanIn(BaseModel):

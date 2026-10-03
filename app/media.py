@@ -119,10 +119,22 @@ async def gallery() -> list[dict]:
 
 async def site_images() -> dict[str, str | None]:
     """The panel-set picture for each slot, or None where the built-in one
-    stands."""
-    rows = await fetch_all("select slot, media_id from site_images")
+    stands — plus `meetText`, the colour of the words over Meet Iris:
+    "light" (white, the default) or "dark" (black)."""
+    rows = await fetch_all(
+        "select slot, media_id, text_tone, pos_x, pos_y, zoom from site_images"
+    )
     chosen = {r["slot"]: url(r["media_id"]) for r in rows}
-    return {slot: chosen.get(slot) for slot in SLOTS}
+    tones = {r["slot"]: r["text_tone"] for r in rows}
+    # How each picture sits in its frame — see site_images in schema.sql.
+    frames = {
+        r["slot"]: {"x": r["pos_x"], "y": r["pos_y"], "zoom": r["zoom"]} for r in rows
+    }
+    return {
+        **{slot: chosen.get(slot) for slot in SLOTS},
+        "meetText": tones.get("meet") or "light",
+        "frames": {slot: frames.get(slot) or {"x": 50, "y": 50, "zoom": 100} for slot in SLOTS},
+    }
 
 
 router = APIRouter(prefix="/api", tags=["media"])

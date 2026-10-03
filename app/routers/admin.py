@@ -15,6 +15,7 @@ Every route here except /login sits behind a signed-in session (see app/auth.py)
     POST   /subscriptions/{id}/status   cancel or reinstate a reader
     PUT    /plans/{region}/{months}     change a price
     PUT    /site-images/{slot}          the hero picture, or a section background
+    PUT    /theme                       the colour palettes of buttons and headings
     POST   /media                       upload a photo
     DELETE /media/{id}                  delete a photo
 """
@@ -25,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from psycopg.types.json import Jsonb
 
-from .. import auth, cycles, mail, media, plans, ratelimit
+from .. import auth, cycles, design, mail, media, plans, ratelimit
 from ..db import fetch_all, fetch_one
 from ..export import edition_workbook
 from ..models import (
@@ -36,6 +37,7 @@ from ..models import (
     PasswordIn,
     PlanIn,
     SiteImageIn,
+    ThemeIn,
 )
 
 STATUSES = ("pending", "active", "expired", "failed", "cancelled")
@@ -152,6 +154,8 @@ async def overview(request: Request) -> dict:
         ],
         "gallery": await media.gallery(),
         "site_images": await media.site_images(),
+        "theme": await design.theme(),
+        "palettes": list(design.PALETTES),
         "email": {"transport": mail.transport(), "last": mail.last_result},
     }
 
@@ -346,14 +350,16 @@ async def set_plan(region: str, months: int, body: PlanIn) -> dict:
 
 @router.put("/site-images/{slot}")
 async def set_site_image(slot: str, body: SiteImageIn) -> dict:
-    """Set the picture for one slot — `hero` (the top of the page), `meet`
-    (behind Meet Iris) or `subscribe` (behind Receive a letter) — or clear it
-    with null to bring back the built-in one."""
+    """Change one slot — `hero` (the top of the page), `meet` (behind Meet
+    Iris) or `subscribe` (behind Receive a letter): its picture (null brings
+    back the built-in one), its text colour, or both. Whatever is not sent is
+    left as it was."""
     if slot not in media.SLOTS:
         raise HTTPException(status_code=404, detail="No such place on the site.")
+    sent = body.model_fields_set
 
     image_id = None
-    if body.media_id:
+    if "media_id" in sent and body.media_id:
         image_id = media.parse_id(body.media_id)
         found = await fetch_one(
             "select id from media where id = %s and kind = 'site'", (image_id,)
@@ -361,25 +367,56 @@ async def set_site_image(slot: str, body: SiteImageIn) -> dict:
         if not found:
             raise HTTPException(status_code=422, detail="That photo does not exist.")
 
-    previous = await fetch_one("select media_id from site_images where slot = %s", (slot,))
+    previous = await fetch_one(
+        "select media_id, text_tone, pos_x, pos_y, zoom from site_images where slot = %s", (slot,)
+    ) or {}
+    if "media_id" not in sent:
+        image_id = previous.get("media_id")
+    tone = body.text_tone if "text_tone" in sent else previous.get("text_tone")
+    # A new picture starts centred and unzoomed; otherwise keep the framing
+    # unless new values were sent.
+    fresh = "media_id" in sent and image_id != previous.get("media_id")
+    frame = {
+        k: (getattr(body, k) if k in sent and getattr(body, k) is not None
+            else (default if fresh else previous.get(k, default)))
+        for k, default in (("pos_x", 50), ("pos_y", 50), ("zoom", 100))
+    }
     await fetch_one(
         """
-        insert into site_images (slot, media_id) values (%s, %s)
-        on conflict (slot) do update set media_id = excluded.media_id, updated_at = now()
+        insert into site_images (slot, media_id, text_tone, pos_x, pos_y, zoom)
+        values (%s, %s, %s, %s, %s, %s)
+        on conflict (slot) do update set
+            media_id = excluded.media_id,
+            text_tone = excluded.text_tone,
+            pos_x = excluded.pos_x, pos_y = excluded.pos_y, zoom = excluded.zoom,
+            updated_at = now()
         returning slot
         """,
-        (slot, image_id),
+        (slot, image_id, tone, frame["pos_x"], frame["pos_y"], frame["zoom"]),
     )
 
     # The picture it replaced is nobody's any more — clear it out.
-    old = (previous or {}).get("media_id")
+    old = previous.get("media_id")
     if old and old != image_id:
         await fetch_one(
             "delete from media where id = %s and kind = 'site' "
             "and not exists (select 1 from site_images where media_id = %s) returning id",
             (old, old),
         )
-    return {"slot": slot, "url": media.url(image_id)}
+    return {"slot": slot, "url": media.url(image_id), "text_tone": tone or "light", **frame}
+
+
+@router.put("/theme")
+async def set_theme(body: ThemeIn) -> dict:
+    """Choose the palette for the buttons and/or the headings, by name."""
+    for key in design.KEYS:
+        value = getattr(body, key)
+        if value is None:
+            continue
+        if value not in design.PALETTES:
+            raise HTTPException(status_code=422, detail=f"No palette called {value}.")
+        await design.set_value(key, value)
+    return {"theme": await design.theme()}
 
 
 @router.post("/media")

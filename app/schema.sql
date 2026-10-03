@@ -569,3 +569,34 @@ create table if not exists site_images (
     media_id    uuid references media (id) on delete set null,
     updated_at  timestamptz not null default now()
 );
+
+
+-- The colour of the words over a slot's picture: 'light' (white) or 'dark'
+-- (black). Only Meet Iris has words over its picture; empty means light.
+alter table site_images add column if not exists text_tone text;
+alter table site_images drop constraint if exists site_images_text_tone_check;
+alter table site_images add constraint site_images_text_tone_check
+    check (text_tone is null or text_tone in ('light', 'dark'));
+
+
+-- ── framing a site picture ──────────────────────────────────────────────────
+-- Where the picture sits in its frame: the point (as % across and down) that
+-- stays in view when the frame crops it, and how far it is zoomed (100 =
+-- just filling the frame). Set with the sliders in the panel.
+alter table site_images add column if not exists pos_x smallint not null default 50;
+alter table site_images add column if not exists pos_y smallint not null default 50;
+alter table site_images add column if not exists zoom  smallint not null default 100;
+alter table site_images drop constraint if exists site_images_frame_check;
+alter table site_images add constraint site_images_frame_check
+    check (pos_x between 0 and 100 and pos_y between 0 and 100 and zoom between 100 and 300);
+
+
+-- ── site design settings ────────────────────────────────────────────────────
+-- Small named settings set from the panel's Design tab: for now, the colour
+-- palette of the buttons and of the headings. Values are palette names, checked
+-- against the list in app/design.py.
+create table if not exists site_settings (
+    key         text primary key,
+    value       text not null,
+    updated_at  timestamptz not null default now()
+);

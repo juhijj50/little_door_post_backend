@@ -7,7 +7,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import countries, cycles, founding, identity, mail, media, payments, plans, ratelimit
+from .. import countries, cycles, design, founding, identity, mail, media, payments, plans, ratelimit
 from ..config import get_settings, make_reference
 from ..cycles import month_name
 from ..db import fetch_one
@@ -541,6 +541,9 @@ async def config() -> dict:
         # The hero picture and the two section backgrounds, where the panel
         # has set one; null means the site's built-in one.
         "siteImages": await media.site_images(),
+        # The colour palettes of the buttons and the headings, by name — the
+        # site turns each into colours (react-app/src/theme.js).
+        "theme": await design.theme(),
     }
 
 
