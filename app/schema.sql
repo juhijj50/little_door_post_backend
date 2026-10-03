@@ -1,8 +1,12 @@
 -- The Little Door Post — schema. Safe to run repeatedly:  python -m app.migrate
 --
--- Four tables:
---   plans        the price list — what a 1, 3 or 6 month subscription costs
---   cycles       one row per delivery month, holding that month's sign-up window
+-- The main tables:
+--   plans        the price list — what a 1, 3 or 12 month subscription costs
+--   cycles       one row per edition (delivery month): open or sold out, and
+--                what goes in that month's envelope
+--   current_edition  which edition is on sale right now — set by hand
+--   media        photographs: the gallery, and each edition's envelope
+--   admin_users / admin_sessions  who can sign in to /admin
 --   subscribers  ONE ROW PER READER, identified by first name + phone
 --   payments     one row per purchase, appended and never rewritten
 --   founding     September's readers, who keep the founding rate for good
@@ -29,43 +33,17 @@ create table if not exists plans (
 -- never a bundle of letters bought at once. The charge is rate × months.
 --
 -- `do nothing` on conflict, so re-running this migration never overwrites a
--- price changed since. The update below is the deliberate exception: it resets
--- India to the current rate card.
+-- price changed since. The rate card itself is set once, further down, under
+-- `data_migrations` — prices are edited from the admin panel now, and a
+-- migration that reset them on every run would quietly undo those edits.
 insert into plans (region, months, currency, amount_minor) values
-    ('india',          1, 'INR',  37500),   -- ₹375 a month
-    ('india',          3, 'INR',  34500),   -- ₹345 a month  → ₹1035
-    ('india',          6, 'INR',  31500),   -- ₹315 a month  → ₹1890
-    ('international',  1, 'USD',   1500),   -- placeholder, to be set later
+    ('india',          1, 'INR',  37500),
+    ('india',          3, 'INR',  34500),
+    ('india',          6, 'INR',  31500),
+    ('international',  1, 'USD',   1500),
     ('international',  3, 'USD',   1400),
     ('international',  6, 'USD',   1300)
 on conflict (region, months) do nothing;
-
--- What is on sale in India, and at what rate. `active` is the switch the site
--- reads: /api/config only lists active plans, and create_subscription refuses
--- a plan that is not one, so an inactive row cannot be bought even by posting
--- straight at the API.
---
--- 20 Sep 2026: only the single month is on sale. The three- and six-month
--- plans are switched off while the rate card is reworked for next month. Their
--- rates are left as they were, because the readers already on them are owed
--- envelopes at the price they paid, and a rate nobody can buy does no harm.
---
--- Next month's card is written up in react-app/src/business.js under
--- `nextRateCard`: 499 / 1380 / 2640 / 5040 for 1 / 3 / 6 / 12 months. The
--- twelve-month row does not exist yet and the `months` check below has to gain
--- a 12 before it can, along with ALLOWED_MONTHS in app/plans.py.
-update plans set amount_minor = v.rate, active = v.on_sale, updated_at = now()
-  from (values (1, 37500, true), (3, 34500, false), (6, 31500, false))
-       as v(months, rate, on_sale)
- where plans.region = 'india' and plans.months = v.months
-   and (plans.amount_minor <> v.rate or plans.active <> v.on_sale);
-
--- International is not sold yet and these are placeholders, but they are left
--- descending so the rate card is never nonsense if it is ever shown.
-update plans set amount_minor = v.rate, active = false, updated_at = now()
-  from (values (1, 1500), (3, 1400), (6, 1300)) as v(months, rate)
- where plans.region = 'international' and plans.months = v.months
-   and (plans.amount_minor <> v.rate or plans.active);
 
 
 -- ── cycles ──────────────────────────────────────────────────────────────────
@@ -383,3 +361,165 @@ alter table payments alter column subscriber_id drop not null;
 drop index if exists payments_open_attempt_idx;
 create unique index if not exists payments_open_per_attempt_idx
     on payments (attempt_id) where status = 'pending';
+
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- October 2026: editions run by hand, the new rate card, photographs, and a
+-- proper sign-in for the admin panel.
+-- ════════════════════════════════════════════════════════════════════════════
+
+-- ── one-off data changes ────────────────────────────────────────────────────
+-- Each runs once, recorded here by name, so re-running the migration never
+-- repeats it. That matters for prices above all: they are edited from the
+-- admin panel now, and a statement that set them on every run would quietly
+-- put back whatever this file said.
+create table if not exists data_migrations (
+    name        text primary key,
+    applied_at  timestamptz not null default now()
+);
+
+
+-- ── twelve months ───────────────────────────────────────────────────────────
+alter table plans drop constraint if exists plans_months_check;
+alter table plans add constraint plans_months_check check (months in (1, 3, 6, 12));
+
+alter table subscribers drop constraint if exists subscribers_plan_months_check;
+alter table subscribers add constraint subscribers_plan_months_check
+    check (plan_months is null or plan_months in (1, 3, 6, 12));
+
+
+-- ── the rate card, from October 2026 ────────────────────────────────────────
+-- India, per month:  1 month ₹549 · 3 months ₹500 (₹1,500) · 12 months ₹450
+-- (₹5,400). Six months is switched off rather than deleted, because readers
+-- already on one are owed envelopes at the price they paid.
+-- Abroad: one letter for $13, postage included. No longer plans.
+do $$
+begin
+    if not exists (select 1 from data_migrations where name = '2026-10-rate-card') then
+        insert into plans (region, months, currency, amount_minor, active)
+        values ('india', 12, 'INR', 45000, true)
+        on conflict (region, months) do nothing;
+
+        update plans set amount_minor = v.rate, active = v.on_sale, updated_at = now()
+          from (values
+                  ('india',          1, 54900, true),
+                  ('india',          3, 50000, true),
+                  ('india',          6, 31500, false),
+                  ('india',         12, 45000, true),
+                  ('international',  1,  1300, true),
+                  ('international',  3,  1400, false),
+                  ('international',  6,  1300, false)
+               ) as v(region, months, rate, on_sale)
+         where plans.region = v.region and plans.months = v.months;
+
+        insert into data_migrations (name) values ('2026-10-rate-card');
+    end if;
+end $$;
+
+
+-- ── photographs ──────────────────────────────────────────────────────────────
+-- Kept in the database rather than on disk: Render's free tier wipes its disk
+-- on every deploy and every restart, so an uploaded file would vanish within
+-- the day. The admin panel shrinks a photo before it is sent, so a row is a
+-- few hundred kilobytes, not the 5 MB a phone takes.
+--
+-- Only these three types are accepted, and the type is read from the file's
+-- own first bytes on upload rather than trusted from the browser. No SVG: an
+-- SVG can carry script.
+create table if not exists media (
+    id            uuid primary key default gen_random_uuid(),
+    kind          text not null check (kind in ('gallery', 'envelope')),
+    content_type  text not null check (content_type in ('image/jpeg', 'image/png', 'image/webp')),
+    data          bytea not null,
+    byte_size     integer not null,
+    caption       text,
+    created_at    timestamptz not null default now()
+);
+
+create index if not exists media_gallery_idx on media (created_at desc) where kind = 'gallery';
+
+
+-- ── editions ─────────────────────────────────────────────────────────────────
+-- An edition is one month's envelope, filed under `cycles` as before. Sign-up
+-- dates no longer decide anything: which edition is on sale, and whether it
+-- has sold out, is set by hand from the admin panel. The date columns stay for
+-- the history of the months that ran by them, and are simply left empty now.
+alter table cycles alter column opens_at  drop not null;
+alter table cycles alter column closes_at drop not null;
+
+alter table cycles add column if not exists status text not null default 'open';
+alter table cycles drop constraint if exists cycles_status_check;
+alter table cycles add constraint cycles_status_check check (status in ('open', 'sold_out'));
+
+-- What is in this month's envelope: [{"title": "...", "detail": "..."}, ...],
+-- shown on the site in that order. Empty means "the same as last month".
+alter table cycles add column if not exists contents jsonb;
+alter table cycles add column if not exists envelope_media_id uuid;
+alter table cycles drop constraint if exists cycles_envelope_media_fk;
+alter table cycles add constraint cycles_envelope_media_fk
+    foreign key (envelope_media_id) references media (id) on delete set null;
+
+-- Which edition is on sale. One row, ever — the primary key can only be true.
+create table if not exists current_edition (
+    singleton   boolean primary key default true check (singleton),
+    cycle       text not null references cycles (cycle),
+    updated_at  timestamptz not null default now()
+);
+
+-- First run only: carry on with the edition the old date rule was selling,
+-- which on the 1st–5th is this month and from the 6th is next month.
+do $$
+declare
+    ist timestamp := now() at time zone 'Asia/Kolkata';
+    selling text;
+begin
+    if not exists (select 1 from current_edition) then
+        selling := to_char(
+            case when extract(day from ist) <= 5 then ist else ist + interval '1 month' end,
+            'YYYY-MM');
+        insert into cycles (cycle, status) values (selling, 'open')
+        on conflict (cycle) do nothing;
+        insert into current_edition (cycle) values (selling);
+    end if;
+end $$;
+
+
+-- ── the admin panel's sign-in ───────────────────────────────────────────────
+-- Passwords are stored as scrypt hashes (see app/auth.py), never as text.
+-- Accounts are made from the command line, not from the web:
+--     python -m app.create_admin
+create table if not exists admin_users (
+    id             uuid primary key default gen_random_uuid(),
+    username       text not null,
+    password_hash  text not null,
+    created_at     timestamptz not null default now(),
+    updated_at     timestamptz not null default now(),
+    last_login_at  timestamptz
+);
+create unique index if not exists admin_users_username_idx on admin_users (lower(username));
+
+-- A signed-in browser. Only a SHA-256 of the token is kept, so a copy of this
+-- table is not a way in.
+create table if not exists admin_sessions (
+    token_hash   text primary key,
+    user_id      uuid not null references admin_users (id) on delete cascade,
+    created_at   timestamptz not null default now(),
+    expires_at   timestamptz not null,
+    ip           text
+);
+create index if not exists admin_sessions_expiry_idx on admin_sessions (expires_at);
+
+
+-- ── founding members pay the twelve-month rate ──────────────────────────────
+-- From October 2026 a founding member's monthly rate is the India twelve-month
+-- rate, read live from `plans` by app/founding.py — so it follows that price
+-- when it is changed in the admin panel. The stored rate is brought in line
+-- once, for the record and as the fallback.
+alter table founding_members alter column rate_minor set default 45000;
+do $$
+begin
+    if not exists (select 1 from data_migrations where name = '2026-10-founding-rate') then
+        update founding_members set rate_minor = 45000;
+        insert into data_migrations (name) values ('2026-10-founding-rate');
+    end if;
+end $$;

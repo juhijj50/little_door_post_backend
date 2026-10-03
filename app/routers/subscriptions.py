@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import cycles, founding, identity, mail, payments, plans, ratelimit
+from .. import countries, cycles, founding, identity, mail, media, payments, plans, ratelimit
 from ..config import get_settings, make_reference
+from ..cycles import month_name
 from ..db import fetch_one
 from ..models import (
     InternationalInterestIn,
@@ -25,49 +25,9 @@ log = logging.getLogger("littledoorpost.subscriptions")
 
 router = APIRouter(prefix="/api", tags=["subscriptions"])
 
-# Everything a reader gets, in the order it sits in the envelope. Served from
-# here so the site and any receipt or email always list the same eight things.
-#
-# Keep in step with `contents` in react-app/src/business.js and ENVELOPE in
-# react-app/src/TheLittleDoorPost.jsx. The Wanderland Passport is deliberately
-# NOT in this list: it goes out once, with a first envelope, so putting it here
-# would have every month's receipt promise one.
-ENVELOPE_CONTENTS = [
-    "A letter from Iris about the place she has wandered into",
-    "A letter from a side character she met there",
-    "A sticker of that month's theme",
-    "A sticker of one of the characters",
-    "An art print from that month's story",
-    "An activity sheet — a puzzle, a recipe, or something to make",
-    "A special poem, written for that month by a friend of Iris",
-    "A printed paper stamp of that month's town, for the Wanderland Passport",
-]
-
-# Sent once, with a first envelope only. Served separately from the list above
-# so the site can name it without claiming it arrives every month.
-FIRST_ENVELOPE_EXTRA = (
-    "A Wanderland Passport — a stapled booklet with a page for every door, "
-    "and somewhere to paste the stamp that comes with each letter"
-)
-
-
-MONTH_NAMES = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
-
-
-def month_name(cycle: str) -> str:
-    """'2026-10' -> 'October 2026'.
-
-    The cycle key is how the database files a month. It is not how anybody
-    reads one, and it was going out in the confirmation email as-is.
-    """
-    try:
-        year, month = (int(part) for part in str(cycle).split("-")[:2])
-        return f"{MONTH_NAMES[month - 1]} {year}"
-    except (ValueError, IndexError):
-        return str(cycle)
+# What goes in an envelope is set per edition from the admin panel now — see
+# `contents` on the cycles table, and DEFAULT_CONTENTS in app/cycles.py for
+# what the first edition started from.
 
 
 def _out(row: dict) -> SubscriptionOut:
@@ -95,6 +55,14 @@ def _out(row: dict) -> SubscriptionOut:
             plans.display(row["rate_minor"], currency)
             if row.get("rate_minor") and currency else None
         ),
+    )
+
+
+def sold_out_message(edition: dict) -> str:
+    described = cycles.describe(edition)
+    return (
+        f"The {described['name']} edition is sold out. "
+        f"The {described['next']['name']} edition opens soon — nothing has been charged."
     )
 
 
@@ -132,6 +100,19 @@ async def _payment_for(row: dict, payment: dict | None = None) -> PaymentOut:
 
     amount, currency = payment["amount_minor"], payment["currency"]
     shown = plans.display(amount, currency)
+
+    # Sold out since this sign-up was started: no new order. An order already
+    # open in Razorpay can still complete, and is honoured if it does — the
+    # money has moved by then — but nobody is handed a fresh way to pay.
+    edition = await cycles.current()
+    if not edition["open"]:
+        return PaymentOut(
+            enabled=False,
+            amount_minor=amount,
+            amount_display=shown,
+            currency=currency,
+            message=sold_out_message(edition),
+        )
 
     if not payments.payments_available():
         return PaymentOut(
@@ -216,6 +197,15 @@ async def _promote(credited: dict) -> dict:
         )
 
     months = credited["plan_months"]
+
+    # The edition may have moved on while this payment was in flight — begun
+    # for October, cleared after the panel had moved to November. October has
+    # been counted by then, so filing the reader under it would count them for
+    # an envelope already packed without them. They start with the edition on
+    # sale now instead, and the ledger says so.
+    current = await cycles.current()
+    attempt = {**attempt, "cycle": max(attempt["cycle"], current["cycle"])}
+
     shared = [attempt[f] for f in SUBSCRIBER_FIELDS]
 
     if attempt["subscriber_id"]:
@@ -256,10 +246,11 @@ async def _promote(credited: dict) -> dict:
 
     # Tie the payment to the reader it bought for, then let the attempt go.
     await fetch_one(
-        "update payments set subscriber_id = %s, updated_at = now() "
+        "update payments set subscriber_id = %s, cycle = %s, updated_at = now() "
         "where id = %s returning id",
-        (row["id"], credited["id"]),
+        (row["id"], attempt["cycle"], credited["id"]),
     )
+    credited["cycle"] = attempt["cycle"]
     await fetch_one(
         "delete from signup_attempts where id = %s returning id", (attempt["id"],)
     )
@@ -284,9 +275,13 @@ async def _confirm_to_reader(row: dict, credited: dict) -> None:
     months = credited["plan_months"]
     amount = plans.display(credited["amount_minor"], credited["currency"])
     envelopes = "one envelope" if months == 1 else f"{months} envelopes, one a month"
-    contents = "\n".join(f"  - {item}" for item in ENVELOPE_CONTENTS)
+    edition = month_name(row["cycle"])
 
     try:
+        items = await cycles.contents_for(await cycles.get(row["cycle"]))
+        contents = "\n".join(
+            f"  - {i['title']}" + (f": {i['detail']}" if i.get("detail") else "") for i in items
+        )
         await mail.notify(
             f"Your letters are on their way, {row['first_name']}",
             f"""Dear {row['first_name']},
@@ -294,15 +289,13 @@ async def _confirm_to_reader(row: dict, credited: dict) -> None:
 Thank you - your subscription to The Little Door Post is confirmed, and Iris
 has your address.
 
-You have paid {amount} for {envelopes}, starting with the {month_name(row['cycle'])} post.
-Your first envelope goes out within ten days of the 5th, and should reach you
-within about a week of that.
+You have paid {amount} for {envelopes}, starting with the {edition} edition.
+Your first envelope is posted when the {edition} edition goes out, and should
+reach you within about a week of that in India (two to six weeks abroad).
 
-Inside every envelope:
+In the {edition} envelope:
 
 {contents}
-
-Your very first envelope also carries {FIRST_ENVELOPE_EXTRA[0].lower()}{FIRST_ENVELOPE_EXTRA[1:]}.
 
 Keep these somewhere safe:
 
@@ -316,8 +309,9 @@ letter that has not arrived, or anything at all.
 One thing worth saying plainly: this does not renew by itself. You have bought
 {envelopes} and nothing more; we cannot charge you again.
 
-Posting to: {row['address_line1'] or ''}, {row['city'] or ''} {row['pincode'] or ''}.
-If any of that is wrong, tell us before the 5th and we will fix it.
+Posting to: {row['address_line1'] or ''}, {row['city'] or ''} {row['pincode'] or ''}, {row['country'] or ''}.
+If any of that is wrong, tell us before 1 {edition} and we will fix it. That
+is also the last day to cancel for a full refund.
 
 With love, and a great deal of paper,
 Iris
@@ -401,6 +395,7 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
                 row["landmark"],
                 " ".join(filter(None, (row["city"], row["pincode"]))),
                 row["state"],
+                row["country"],
             )
             if line
         )
@@ -426,7 +421,7 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
             f"  Phone     : {row['phone']}\n"
             f"  Instagram : @{row['instagram'] or '(none given)'}\n"
             f"  Email     : {row['email']}\n"
-            f"  Starting  : the {credited['cycle']} envelope\n"
+            f"  Starting  : the {month_name(credited['cycle'])} edition\n"
             f"  Owed now  : {row['deliveries_remaining']} envelope"
             f"{'' if row['deliveries_remaining'] == 1 else 's'}\n"
             f"{extras}\n"
@@ -436,14 +431,6 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
         log.exception("payment credited but could not be emailed: %s", row["reference"])
 
     return row
-
-
-# The price a letter abroad will carry once the export process is set up. In
-# US dollars because that is what an international reader is quoted in, and
-# stated on the site next to the waiting list so nobody joins it expecting the
-# India price. Not in the `plans` table yet on purpose — nothing can be sold at
-# it until posting abroad actually opens.
-INTERNATIONAL_INDICATIVE_USD = 12
 
 
 @router.post(
@@ -507,7 +494,7 @@ async def register_international_interest(body: InternationalInterestIn) -> Inte
   Email     : {row['email'] or '(none given)'}
 
 {waiting['n']} waiting to be told, in total.
-The whole list is at /api/admin/international-interest.
+The whole list is in the international_interest table.
 """,
             )
         except Exception:  # noqa: BLE001 — their request is saved either way
@@ -522,26 +509,35 @@ The whole list is at /api/admin/international-interest.
 
 @router.get("/config")
 async def config() -> dict:
-    """Prices, the current window and payment availability, read at page load.
+    """Everything the page reads at load, in one request: the edition on sale
+    and whether it has sold out, the prices, what is in this month's envelope,
+    and the gallery.
 
-    Resolving the cycle also sweeps any month that has closed since the last
-    request, which is what advances everyone's delivery counter without a cron.
+    One request rather than several on purpose — the API sleeps on Render's
+    free tier, and this is the call that wakes it.
     """
     await cycles.sweep()
-    cycle = await cycles.current()
+    edition = await cycles.current()
+    items = await cycles.contents_for(edition)
 
     return {
-        "signupOpen": cycle["open"],
-        "cycle": cycle["cycle"],
-        "opensAt": cycle["opens_at"].isoformat(),
-        "closesAt": cycle["closes_at"].isoformat(),
+        "edition": cycles.describe(edition),
+        # Kept for anything still reading the old names.
+        "signupOpen": edition["open"],
+        "cycle": edition["cycle"],
         "plans": await plans.catalogue(),
         "paymentsEnabled": payments.payments_available(),
         "paymentsMessage": None if payments.payments_available() else payments.PAYMENTS_PENDING_MESSAGE,
-        "internationalOpen": False,
-        "internationalIndicativeUsd": INTERNATIONAL_INDICATIVE_USD,
-        "contents": ENVELOPE_CONTENTS,
-        "firstEnvelopeExtra": FIRST_ENVELOPE_EXTRA,
+        "internationalOpen": bool(await plans.for_region("international")),
+        "countries": countries.INTERNATIONAL,
+        "envelope": {
+            "items": items,
+            "image": media.url(edition.get("envelope_media_id")),
+        },
+        "gallery": [
+            {"id": g["id"], "url": g["url"], "caption": g["caption"]}
+            for g in await media.gallery()
+        ],
     }
 
 
@@ -557,35 +553,24 @@ async def config() -> dict:
     ],
 )
 async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
-    # Iris posts abroad, but no price is set for it — postage varies too much by
-    # country for one figure to cover it. So there is nothing to charge and
-    # nothing worth keeping. The site says so and stops; this refuses a direct
-    # POST too, so no row can be created by going round the form.
-    if body.region == "international":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Postage outside India is worked out per country — "
-                "write to us on Instagram and Iris will sort it for you."
-            ),
-        )
-
     await cycles.sweep()
     cycle = await cycles.current()
 
-    # No window check. The site is only linked from the Instagram bio while
-    # sign-ups are running, so being able to reach this at all is the gate —
-    # which is also what lets the page render without waiting to be told.
-    # `cycle` is still needed: it is the delivery month a purchase buys into,
-    # and what the monthly roll-over counts against.
+    # Sold out is set by hand from the admin panel, and it is a hard stop: the
+    # page says so too, but a page is a suggestion and this is the rule.
+    if not cycle["open"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": sold_out_message(cycle), "fields": {}, "soldOut": True},
+        )
 
     plan = await plans.get(body.region, body.plan_months)
     if not plan:
         raise HTTPException(
             status_code=422,
             detail={
-                "error": "That subscription length is not available.",
-                "fields": {"plan_months": "Choose 1, 3 or 6 months"},
+                "error": "That subscription length is not on sale.",
+                "fields": {"plan_months": "Choose one of the lengths shown"},
             },
         )
 

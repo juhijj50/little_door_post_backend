@@ -19,8 +19,8 @@ A send that fails never breaks the request that caused it — by the time this
 runs, the payment or the sign-up is already safely in the database. But it is
 no longer silent about it either. The first version logged a failure as a
 warning and moved on, which is exactly how paid orders went un-emailed with
-nobody noticing. Failures are now logged as errors and remembered, and
-/api/admin/test-email reports them.
+nobody noticing. Failures are now logged as errors and remembered, and the
+admin panel's Account tab reports them.
 """
 
 from __future__ import annotations

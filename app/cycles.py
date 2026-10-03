@@ -1,108 +1,176 @@
-"""Delivery months: when sign-ups run, and what happens when a month ends.
+"""Editions: which month's envelope is on sale, and what happens when it moves on.
 
-A *cycle* is the month an envelope goes out, written 'YYYY-MM'. The window that
-opens on 15 September and closes on 5 October fills cycle 2026-10.
+An *edition* is the month an envelope goes out, written 'YYYY-MM' and filed in
+the `cycles` table. Which edition is on sale, and whether it has sold out, is
+set by hand from the admin panel — there are no sign-up dates any more:
 
-The dates come from the `cycles` table, not from this code. A row is created on
-demand using the default rule — the 15th to the 5th — and can then be edited;
-whatever the table says wins. That is the whole point of keeping them in the
-database rather than in a constant.
+    October 2026 · open       sign-ups buy into the October envelope
+    October 2026 · sold out   the site says October is sold out, November
+                              opens soon, and sign-ups are refused
+    November 2026 · open      selling again, now for November
+
+Moving the edition forward is also what counts the envelopes: every edition
+before the new one is rolled over, so a one-month October reader is finished
+and a three-month one has two to go. That used to happen on a timer, ten days
+after a date-based window closed; with the dates gone, the edition moving on
+is the one moment that reliably means "that month is done".
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from .db import fetch_all, fetch_one
 
 log = logging.getLogger("littledoorpost.cycles")
 
-# Sign-ups are advertised in Indian time, and the server runs in UTC. Without
-# this the window would open at 05:30 on the 15th for a reader in Delhi. India
-# has no daylight saving, so a fixed offset is exact — and saves depending on
-# the tz database being installed.
+# Indian time, for the one place a date is still worked out: the fallback if
+# the current edition has somehow gone missing. India has no daylight saving,
+# so a fixed offset is exact.
 IST = timezone(timedelta(hours=5, minutes=30))
 
-OPEN_DAY = 15   # sign-ups open on the 15th...
-CLOSE_DAY = 5   # ...and close on the 5th of the next month
+CYCLE_RE = re.compile(r"^(20\d\d)-(0[1-9]|1[0-2])$")
+
+MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+STATUSES = ("open", "sold_out")
+
+# What is in an envelope until an edition says otherwise. Every edition can
+# have its own list, edited from the admin panel; a new edition starts with a
+# copy of the last one's. This is only what the very first edition starts from.
+#
+# The pieces are named, every one of them. A subscription whose contents are a
+# surprise reads to a payment aggregator as a category it does not support, and
+# this business has been turned down on exactly that ground once already — so
+# whatever an edition lists, it should stay a list of real, printed things.
+DEFAULT_CONTENTS = [
+    {"title": "A letter from Iris",
+     "detail": "Two printed pages from the corner of the world she has wandered into this month."},
+    {"title": "A letter from someone she met",
+     "detail": "One printed page from a person who lives there — or lived there, long ago."},
+    {"title": "A place sticker",
+     "detail": "A die-cut sticker of that month's corner of the world."},
+    {"title": "A character sticker",
+     "detail": "A die-cut sticker of Iris, or of somebody she met on the way."},
+    {"title": "An art print",
+     "detail": "A small illustrated print on card, drawn from that month's place."},
+    {"title": "An activity sheet",
+     "detail": "One page — a puzzle, a recipe from that place, or something to make."},
+    {"title": "A special poem",
+     "detail": "Written for that month by a friend of Iris, and printed to keep."},
+    {"title": "A stamp of the place",
+     "detail": "A printed paper stamp of that month's corner of the world, for your passport."},
+    {"title": "A Wanderland Passport",
+     "detail": "For first-time subscribers. A booklet with a page for every door, "
+               "and a stamp to paste in each time a letter lands."},
+]
 
 
-def _month_key(year: int, month: int) -> str:
-    return f"{year}-{month:02d}"
+def valid_cycle(cycle: str) -> bool:
+    return bool(CYCLE_RE.match(cycle or ""))
 
 
-def _shift(year: int, month: int, by: int) -> tuple[int, int]:
-    index = (year * 12 + (month - 1)) + by
-    return index // 12, index % 12 + 1
+def shift(cycle: str, by: int) -> str:
+    """'2026-12', +1 -> '2027-01'."""
+    year, month = (int(p) for p in cycle.split("-"))
+    index = year * 12 + (month - 1) + by
+    return f"{index // 12}-{index % 12 + 1:02d}"
 
 
-def default_window(now: datetime | None = None) -> tuple[str, datetime, datetime]:
-    """The cycle we are in or heading towards, and its default dates.
+def month_name(cycle: str) -> str:
+    """'2026-10' -> 'October 2026'. The key is how the database files a month,
+    not how anybody reads one."""
+    try:
+        year, month = (int(part) for part in str(cycle).split("-")[:2])
+        return f"{MONTH_NAMES[month - 1]} {year}"
+    except (ValueError, IndexError):
+        return str(cycle)
 
-    On the 1st–5th the open window is the one that began on the 15th of last
-    month, and it fills *this* month. From the 6th onwards the next window fills
-    *next* month — whether it has opened yet (from the 15th) or not (6th–14th).
-    """
+
+def describe(row: dict) -> dict:
+    """An edition as the site and the panel read it."""
+    cycle = row["cycle"]
+    return {
+        "cycle": cycle,
+        "name": month_name(cycle),
+        "status": row["status"],
+        "open": row["status"] == "open",
+        "next": {"cycle": shift(cycle, 1), "name": month_name(shift(cycle, 1))},
+    }
+
+
+def _fallback_cycle(now: datetime | None = None) -> str:
+    """The edition the old date rule would be selling. Only used if the
+    current-edition row is missing, which the migration makes sure it is not."""
     now = (now or datetime.now(IST)).astimezone(IST)
-
-    if now.day <= CLOSE_DAY:
-        year, month = now.year, now.month
-    else:
-        year, month = _shift(now.year, now.month, 1)
-
-    open_year, open_month = _shift(year, month, -1)
-    opens_at = datetime(open_year, open_month, OPEN_DAY, 0, 0, 0, tzinfo=IST)
-    # Inclusive of the whole of the 5th — "closes on the 5th" should mean the
-    # end of that day, not one second past midnight.
-    closes_at = datetime(year, month, CLOSE_DAY, 23, 59, 59, tzinfo=IST)
-
-    return _month_key(year, month), opens_at, closes_at
+    cycle = f"{now.year}-{now.month:02d}"
+    return cycle if now.day <= 5 else shift(cycle, 1)
 
 
-async def _ensure(cycle: str, opens_at: datetime, closes_at: datetime) -> dict:
-    """Fetch the cycle's row, creating it with the default dates if it is new.
+async def current() -> dict:
+    """The edition on sale right now: its row, plus `open`."""
+    row = await fetch_one(
+        "select c.* from current_edition e join cycles c on c.cycle = e.cycle"
+    )
+    if row is None:
+        log.error("no current edition set - falling back to the date rule")
+        row = await set_current(_fallback_cycle(), "open")
+    return {**row, "open": row["status"] == "open"}
 
-    The conflict clause updates the key to itself: a no-op that still returns
-    the existing row, so this is one round trip whether or not it already
-    exists — and it never overwrites dates someone has edited.
+
+async def get(cycle: str) -> dict | None:
+    return await fetch_one("select * from cycles where cycle = %s", (cycle,))
+
+
+async def set_current(cycle: str, status: str) -> dict:
+    """Put an edition on sale (or mark it sold out) and make it the current one.
+
+    A month that has never been an edition before starts with a copy of the
+    most recent envelope contents, so moving on to November does not leave the
+    site listing nothing while the new list is written. Its photograph is not
+    copied — that is of one particular envelope.
     """
-    return await fetch_one(
+    row = await fetch_one(
         """
-        insert into cycles (cycle, opens_at, closes_at)
-        values (%s, %s, %s)
-        on conflict (cycle) do update set cycle = excluded.cycle
+        insert into cycles (cycle, status, contents)
+        values (%(cycle)s, %(status)s,
+                (select contents from cycles
+                  where contents is not null and cycle <> %(cycle)s
+                  order by cycle desc limit 1))
+        on conflict (cycle) do update set
+            status = excluded.status,
+            updated_at = now()
         returning *
         """,
-        (cycle, opens_at, closes_at),
+        {"cycle": cycle, "status": status},
     )
-
-
-async def current(now: datetime | None = None) -> dict:
-    """The cycle sign-ups belong to right now, plus whether they are open.
-
-    Looks for a window the clock is actually inside first, so an edited cycle —
-    one held open a week longer, say — is honoured over the default rule. Only
-    when nothing is open does it fall back to computing the next one.
-    """
-    now = (now or datetime.now(IST)).astimezone(IST)
-
-    open_now = await fetch_one(
+    await fetch_one(
         """
-        select * from cycles
-        where opens_at <= %s and closes_at >= %s
-        order by opens_at desc
-        limit 1
+        insert into current_edition (singleton, cycle) values (true, %s)
+        on conflict (singleton) do update set cycle = excluded.cycle, updated_at = now()
+        returning cycle
         """,
-        (now, now),
+        (cycle,),
     )
-    if open_now:
-        return {**open_now, "open": True}
+    return row
 
-    cycle, opens_at, closes_at = default_window(now)
-    row = await _ensure(cycle, opens_at, closes_at)
-    # The row may carry edited dates that leave it shut at this moment.
-    return {**row, "open": row["opens_at"] <= now <= row["closes_at"]}
+
+async def contents_for(row: dict | None) -> list[dict]:
+    """What is in an edition's envelope. An edition that has no list of its own
+    shows the most recent one that does, then the default."""
+    if row and row.get("contents"):
+        return row["contents"]
+    earlier = await fetch_one(
+        "select contents from cycles where contents is not null "
+        "and (%s::text is null or cycle <= %s) order by cycle desc limit 1",
+        ((row or {}).get("cycle"), (row or {}).get("cycle")),
+    )
+    return (earlier or {}).get("contents") or DEFAULT_CONTENTS
 
 
 async def roll_over(cycle: str) -> int:
@@ -112,8 +180,7 @@ async def roll_over(cycle: str) -> int:
     dropped halfway cannot leave half the list decremented.
 
     It is also idempotent. `last_counted_cycle < cycle` excludes anyone already
-    counted for this month, so running it twice is a no-op the second time,
-    which is what makes it safe to trigger automatically *and* by hand.
+    counted for this month, so running it twice is a no-op the second time.
 
     Returns how many subscriptions it touched.
     """
@@ -134,8 +201,53 @@ async def roll_over(cycle: str) -> int:
 
     if rows:
         done = sum(1 for r in rows if r["status"] == "expired")
-        log.info("cycle %s: counted %d subscriptions, %d finished", cycle, len(rows), done)
+        log.info("edition %s: counted %d subscriptions, %d finished", cycle, len(rows), done)
     return len(rows)
+
+
+async def close_edition(cycle: str) -> int:
+    """Count the envelopes of the edition that was on sale, as the panel moves
+    on past it. Returns how many readers were counted.
+
+    Only that one edition. It is the only one anybody could have bought into,
+    so it is the only one with readers not yet counted — an edition whose
+    contents were written ahead of time but that never went on sale has nobody
+    to count, and must not take an envelope off anyone. A payment that clears
+    late, after this has run, joins the edition on sale instead (see _promote
+    in routers/subscriptions.py).
+
+    Safe to repeat: roll_over() skips anyone already counted for the month.
+    """
+    counted = await roll_over(cycle)
+    await fetch_one(
+        "update cycles set rolled_over_at = coalesce(rolled_over_at, now()), "
+        "updated_at = now() where cycle = %s returning cycle",
+        (cycle,),
+    )
+    return counted
+
+
+# The posting list for one edition: who that month's envelope goes to.
+#
+# Two kinds of reader. Before the edition is counted, everybody still owed an
+# envelope whose subscription has started by then. After it is counted, the
+# ones who were counted *for* it — which is what keeps the list right while the
+# envelopes are still being packed, after the panel has already moved on to
+# the next month.
+POSTING_LIST_SQL = """
+    select * from subscribers s
+    where s.cycle <= %(cycle)s
+      and (
+            (s.last_counted_cycle = %(cycle)s and s.status not in ('cancelled', 'failed'))
+         or (s.status = 'active' and s.deliveries_remaining > 0
+             and (s.last_counted_cycle is null or s.last_counted_cycle < %(cycle)s))
+      )
+    order by s.full_name
+"""
+
+
+async def posting_list(cycle: str) -> list[dict]:
+    return await fetch_all(POSTING_LIST_SQL, {"cycle": cycle})
 
 
 # How long a half-finished sign-up is kept. Long enough that someone who pays
@@ -151,11 +263,6 @@ async def discard_abandoned() -> dict:
     order created before the customer pays, and if the address lived only in
     their browser, a tab that died mid-payment would leave money taken and
     nowhere to post to. So it is written first and cleaned up after.
-
-    Nothing here touches `subscribers`. An attempt only ever becomes a
-    subscriber by being paid for, so an abandoned one is simply deleted and
-    nobody's history is at stake — which is what the old version had to be
-    careful about, back when unpaid sign-ups shared a table with paid ones.
 
     An attempt with a *paid* payment against it is left alone: that is a
     promotion caught mid-flight, not an abandonment.
@@ -187,52 +294,9 @@ async def discard_abandoned() -> dict:
     }
 
 
-async def sweep(now: datetime | None = None) -> list[str]:
-    """Roll over every month whose envelopes have had time to go out.
-
-    Timing matters here, and getting it wrong is worse than it looks. A month is
-    *not* counted when its window shuts on the 5th — the envelopes have not been
-    posted yet at that point, and expiring a one-letter reader early would drop
-    them off the mailing list before the letter they paid for was ever sent.
-
-    So a month is counted once the *next* window opens on the 15th, which leaves
-    ten days to pack and post.
-
-    This is what makes the lifecycle automatic without a scheduler — Render's
-    free plan has no cron, and a sleeping service would miss one anyway. Any
-    request that resolves the current cycle passes through here, and because
-    roll_over() is idempotent it does not matter how often that happens or how
-    many requests arrive at once.
-    """
-    now = (now or datetime.now(IST)).astimezone(IST)
-
-    # "Has the next window opened?" needs the next window to exist as a row.
-    # Resolving the current cycle creates it if it does not.
-    await current(now)
-
-    # Same hook, same reasoning: this is the one place every request passes
-    # through, so housekeeping rides along rather than needing a scheduler.
+async def sweep() -> None:
+    """Housekeeping that rides along on ordinary requests — Render's free plan
+    has no cron, and a sleeping service would miss one anyway: abandoned
+    sign-ups, and admin sessions that have run out."""
     await discard_abandoned()
-
-    due = await fetch_all(
-        """
-        select c.cycle from cycles c
-        where c.rolled_over_at is null
-          and c.closes_at < %(now)s
-          and exists (select 1 from cycles later
-                      where later.cycle > c.cycle and later.opens_at <= %(now)s)
-        order by c.cycle
-        """,
-        {"now": now},
-    )
-
-    rolled = []
-    for row in due:
-        await roll_over(row["cycle"])
-        await fetch_one(
-            "update cycles set rolled_over_at = now(), updated_at = now() "
-            "where cycle = %s and rolled_over_at is null returning cycle",
-            (row["cycle"],),
-        )
-        rolled.append(row["cycle"])
-    return rolled
+    await fetch_all("delete from admin_sessions where expires_at < now() returning token_hash")

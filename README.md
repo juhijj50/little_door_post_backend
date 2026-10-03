@@ -18,6 +18,39 @@ uvicorn app.main:app --reload --port 8000
 
 Interactive docs while it runs: <http://localhost:8000/docs>
 
+## The monthly window
+
+A window runs from the **6th of one month to the 5th of the next**, and fills
+that next month's edition. Pay on 6 October and you are buying the November
+letter. Windows run back to back — one shuts, the next opens the following day
+— so there is never a stretch when the club cannot be joined.
+
+`OPEN_DAY` and `CLOSE_DAY` in `app/cycles.py` are the rule; the `cycles` table
+is the exception, and whatever a row says wins for that month.
+
+**Counting a month is on its own clock.** `DISPATCHED_AFTER` (10 days past the
+close) is when a month's envelopes are counted against everyone's remaining
+total. It used to key off the next window opening, which worked only while that
+was the 15th. With windows opening on the 6th that test would fire the day
+after a window shut — before a single envelope had been posted — and expire
+every one-month reader on the way out of the door.
+
+## Where the post goes
+
+`app/countries.py` is the rule, and `/api/config` serves the same list to the
+form, so the dropdown cannot offer somewhere an order would be refused for.
+
+The EU, the EEA and the UK are **excluded on purpose**: consumer law there
+gives a distance buyer fourteen days to withdraw and be refunded in full,
+including the envelope already posted. That right follows the buyer, so it
+would bind this business the moment it sold to Dublin. `refusal()` says so in
+words a reader can act on, and aliases mean somebody typing "England" is told
+we do not post there rather than that England is not a place.
+
+India is ₹375 a letter; everywhere else is **$12**, in USD — Razorpay raises
+USD orders on this account, so a foreign card is charged in dollars rather than
+a rupee figure it has to convert.
+
 ## Two tables, not one
 
 `subscribers` holds people who have **paid**, and nobody else. A sign-up that
@@ -51,15 +84,24 @@ Two go out, both through `app/mail.py`:
 
 Both are wrapped and non-fatal. By the time either runs the money is banked and
 the row is written, so a dead mailbox must never turn a successful payment into
-an error for whoever just paid. Check it with `POST /api/admin/test-email`.
+an error for whoever just paid. The admin panel's **Account** tab shows which
+way email goes and how the last send turned out.
 
 ## Deploying to Render
 
 `render.yaml` in this folder is a Blueprint: **New > Blueprint** in the Render
 dashboard, point it at this repo, and it creates the service with the build and
 start commands, region, health check and environment already set. It stops to
-ask for the six values marked `sync: false` — the Neon URL, the admin token,
-your site's origin, and the three Razorpay keys (leave those blank for now).
+ask for the values marked `sync: false` — the Neon URL, your site's origin,
+the email settings and the three Razorpay keys.
+
+After a deploy that changes `schema.sql`, run the migration from your own
+machine — `backend/.env` points at the same Neon database:
+
+```
+python -m app.migrate        # safe to run any number of times
+python -m app.create_admin   # first time only: makes your admin login
+```
 
 Doing it by hand instead? The settings that matter:
 
@@ -84,7 +126,6 @@ Everything lives in `backend/.env` — see `.env.example` for the full list.
 | Variable | What it does |
 | --- | --- |
 | `DATABASE_URL` | Neon connection string (pooled or direct; the `postgresql+psycopg://` form Neon offers for SQLAlchemy is accepted too) |
-| `ADMIN_TOKEN` | Guards `/api/admin/*`. Set it to something long and random |
 | `CORS_ORIGINS` | Comma-separated origins allowed to call the API. No trailing slash — a browser never sends one |
 | `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | **Empty until the account is approved** |
 
@@ -150,20 +191,43 @@ retries non-2xx replies and eventually disables a webhook that keeps failing.
 | Method | Path | What it does |
 | --- | --- | --- |
 | `GET` | `/api/health` | Liveness plus a database ping |
-| `GET` | `/api/config` | Price, sign-up window, payment availability, envelope contents |
-| `POST` | `/api/subscriptions` | Create or update a sign-up for this month |
+| `GET` | `/api/config` | Everything the page reads at load: the edition on sale (open or sold out), prices, this edition's envelope and photo, the gallery |
+| `GET` | `/api/media/{id}` | One photograph, cached for good (a new upload is a new id) |
+| `POST` | `/api/subscriptions` | Create or update a sign-up — refused with 409 while the edition is sold out |
 | `GET` | `/api/subscriptions/{id}` | Read one back |
 | `POST` | `/api/subscriptions/{id}/order` | Re-open checkout for an unpaid sign-up |
 | `POST` | `/api/subscriptions/{id}/verify` | Confirm a Razorpay payment (signature checked) |
 | `POST` | `/api/payments/webhook` | Razorpay's own report of the same payment |
-| `GET` | `/api/admin/subscriptions` | List and search sign-ups |
-| `GET` | `/api/admin/subscriptions.csv` | Address labels for the month's paid readers |
-| `POST` | `/api/admin/subscriptions/{id}/status` | Set a status by hand |
-| `GET` | `/api/admin/birthdays?month=` | Whose birthday falls this month |
-| `GET` | `/api/admin/interests` | What readers asked to read about |
+| `POST` | `/api/international-interest` | "Tell me when you post to my country" |
 
-Admin routes want the token as an `X-Admin-Token` header, or `?token=` so a
-link opens in a browser.
+### The admin panel's API
+
+The panel lives at `/admin` on the site. Every route below except `/login`
+needs `Authorization: Bearer <token>`, the token `/login` hands back.
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| `POST` | `/api/admin/login` | Username + password → a 12-hour session. Ten tries per 15 minutes per address |
+| `POST` | `/api/admin/logout` | End this session |
+| `POST` | `/api/admin/password` | Change your password; signs out every other session |
+| `GET` | `/api/admin/overview` | Everything the dashboard shows |
+| `PUT` | `/api/admin/edition` | `{cycle, status}` — which edition is on sale, open or sold out. Moving forward counts the old edition's envelopes |
+| `PUT` | `/api/admin/editions/{cycle}` | `{items, envelope_media_id}` — what is in that envelope, and its photo |
+| `GET` | `/api/admin/editions/{cycle}/export` | That edition's readers as Excel (Signed up / To post) |
+| `GET` | `/api/admin/subscriptions` | Search readers |
+| `POST` | `/api/admin/subscriptions/{id}/status` | Cancel or reinstate a reader |
+| `PUT` | `/api/admin/plans/{region}/{months}` | Change a price (per month, in paise or cents) |
+| `POST` | `/api/admin/media?kind=gallery\|envelope&caption=` | Upload a photo — the body is the image itself |
+| `DELETE` | `/api/admin/media/{id}` | Delete a photo |
+
+**Security, in short.** Passwords are stored as salted scrypt hashes, never as
+text; accounts are made only with `python -m app.create_admin`, so there is no
+sign-up page to attack. Sessions are random tokens of which only a SHA-256 is
+stored. A wrong username and a wrong password get the same answer in the same
+time. Uploads are checked by their own bytes — JPEG, PNG and WebP only, 5 MB
+at most, never SVG. The Excel export writes anything a reader typed as text,
+never as a formula. Admin responses are `Cache-Control: no-store`, and every
+response carries `nosniff`, `X-Frame-Options: DENY` and `no-referrer`.
 
 ## What is and is not stored
 
@@ -268,19 +332,20 @@ instead of adding would quietly swallow what they had already paid for.
 
 Three tables carry it.
 
-**`plans`** is the price list — one row per region and length, six in all. Amounts
-are integers in *minor units* (paise, cents), so nothing is ever a float and
+**`plans`** is the price list — one row per region and length. Amounts are
+integers in *minor units* (paise, cents), so nothing is ever a float and
 Razorpay gets exactly the number it wants. Change a price and only new sign-ups
 see it: a subscriber row records what was actually charged, and history must not
-be rewritten by a later price change.
+be rewritten by a later price change. From October 2026: India ₹549 / ₹500 /
+₹450 a month for 1 / 3 / 12 months; abroad $13 for one letter.
 
-**`cycles`** is one row per delivery month, holding that month's sign-up window.
-Rows are created on demand from the default rule — the 15th to the 5th, in
-Indian time — and can then be edited. **Whatever the table says wins**, so
-`PUT /api/admin/cycles/2026-11` with different dates moves that one month and
-nothing else.
+**`cycles`** is one row per *edition* — the month an envelope goes out — with
+its status (`open` or `sold_out`) and what is in that envelope. **There are no
+sign-up dates any more.** Which edition is on sale is set by hand in the admin
+panel and kept in `current_edition`; every purchase records the edition it
+bought into, in `payments.cycle`.
 
-**`subscribers`** carries `plan_months` (1, 3 or 6) and `deliveries_remaining`,
+**`subscribers`** carries `plan_months` (1, 3, 6 or 12) and `deliveries_remaining`,
 a counter that starts at the plan length *when the payment clears*, not at
 sign-up — an unpaid row owes nothing and can never appear on a mailing list.
 
@@ -300,34 +365,27 @@ atomic — a dropped connection cannot leave half the list decremented — and
 `last_counted_cycle < :cycle` makes it idempotent, so running it twice for the
 same month is a no-op the second time.
 
-**When it runs matters.** A month is counted once the *next* window opens on the
-15th — not when its own window shuts on the 5th. The envelopes have not been
-posted on the 5th, and expiring a one-letter reader then would drop them off the
-mailing list before the letter they paid for was ever sent. Counting on the 15th
-leaves ten days to pack and post.
+**When it runs.** An edition is counted when the panel *moves past it* — when
+November goes on sale, October is counted (`cycles.close_edition()`). Marking
+October sold out does not count it; only moving on does. Only the edition that
+was on sale is counted, since it is the only one anybody could have bought
+into.
 
-That is what lets it run automatically without a scheduler: every request that
-resolves the current cycle sweeps any month now due (`cycles.sweep()`). Render's
-free plan has no cron, and a sleeping service would miss one anyway.
-`POST /api/admin/sweep` and `POST /api/admin/cycles/{cycle}/roll` do the same
-thing by hand — the latter for when you have posted early.
+The export still lists October's readers after the count: its **To post** sheet
+takes in everyone counted *for* October, so the list is right while the
+envelopes are still being packed and the site has already moved on.
 
-**Where the housekeeping runs.** `cycles.sweep()` does both jobs — rolling over
-any month now due, and discarding abandoned sign-ups — and is called from six
-places: `GET /api/config` (so every page load triggers it), `POST /api/subscriptions`,
-`GET /api/admin/cycles`, `POST /api/admin/sweep`, and both mailing-list
-endpoints.
+A payment that clears after its edition was counted — begun for October,
+finished after November opened — joins the edition on sale instead, so it is
+never counted for an envelope already packed without it.
 
-The mailing-list ones matter most. They are read exactly when the site has been
-quietest — between windows, when no visitor has triggered anything — and they
-are what you print labels from. Sweeping there first is what stops a reader
-whose subscription has quietly run out from getting an envelope nobody paid for.
+**Housekeeping.** `cycles.sweep()` discards sign-ups abandoned for 24 hours and
+expired admin sessions. It rides on `GET /api/config` and the panel's overview,
+since Render's free plan has no cron.
 
 **Expired, not deleted.** An expired subscription drops off every list
 immediately, but the row stays. A Razorpay chargeback can arrive months after
-the fact and that row is the evidence. `POST /api/admin/purge` really deletes,
-but it needs `?confirm=true`, refuses anything under 30 days old, and never
-touches an active or pending row.
+the fact and that row is the evidence.
 
 ## What gets stored
 

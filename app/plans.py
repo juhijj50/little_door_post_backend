@@ -12,15 +12,15 @@ from __future__ import annotations
 
 from .db import fetch_all, fetch_one
 
-ALLOWED_MONTHS = (1, 3, 6)
+ALLOWED_MONTHS = (1, 3, 6, 12)
 
 
 def display(amount_minor: int, currency: str) -> str:
-    """'27900', 'INR' -> '₹279'. Whole units when it divides evenly, because
-    ₹279 reads better than ₹279.00 on a button."""
+    """'27900', 'INR' -> '₹279'; '540000' -> '₹5,400'. Whole units when it
+    divides evenly, because ₹279 reads better than ₹279.00 on a button."""
     symbol = "₹" if currency == "INR" else "$"
     major, minor = divmod(amount_minor, 100)
-    return f"{symbol}{major}" if minor == 0 else f"{symbol}{major}.{minor:02d}"
+    return f"{symbol}{major:,}" if minor == 0 else f"{symbol}{major:,}.{minor:02d}"
 
 
 def as_dict(row: dict) -> dict:

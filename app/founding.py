@@ -1,7 +1,10 @@
 """September's readers, and the rate they keep.
 
-A founding member pays the founding rate however short a plan they take — one
-letter costs them what six letters a month costs everybody else.
+A founding member pays the **twelve-month rate** per month, however short a
+plan they take — one letter costs them what a year's subscriber pays a month.
+The rate is read live from the India twelve-month row in `plans`, so changing
+that price in the admin panel changes theirs with it; `founding_members.rate_minor`
+is only the fallback if that row is ever missing.
 
 The code alone is never enough. Codes get screenshotted and passed around, so
 `FOUNDING15` only works from the phone number it was issued against: the code
@@ -52,6 +55,21 @@ async def rate_for(
     if member["code"] != code:
         return standard_minor, None, "That code is not the one on this number."
 
-    rate = min(member["rate_minor"], standard_minor)
+    # The twelve-month rate, on or off sale — it is the founding price either
+    # way. Only in the reader's own currency: abroad there is no twelve-month
+    # plan, and a rupee rate must never be compared with a dollar one.
+    year = await fetch_one(
+        "select amount_minor from plans where region = %s and months = 12", (region,)
+    )
+    if year:
+        founding_minor = year["amount_minor"]
+    elif region == "india":
+        founding_minor = member["rate_minor"]
+    else:
+        founding_minor = standard_minor
+
+    # Never more than the standard price: on the twelve-month plan itself the
+    # code simply changes nothing.
+    rate = min(founding_minor, standard_minor)
     log.info("founding rate applied for %s", member["first_name"])
     return rate, member["code"], None

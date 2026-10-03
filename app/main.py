@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from . import media
 from .config import get_settings
 from .db import close_pool, fetch_one, open_pool
 from .models import FIELD_SEPARATOR
@@ -49,8 +50,14 @@ async def lifespan(_app: FastAPI):
         log.error("%s\n  (%s)\n", SETUP_HELP, exc)
         raise SystemExit(1) from None
     log.info("origins allowed: %s", ", ".join(settings.origins))
-    if not settings.admin_token:
-        log.warning("ADMIN_TOKEN is not set - /api/admin/* is disabled")
+    try:
+        admins = await fetch_one("select count(*)::int as n from admin_users")
+        if not admins["n"]:
+            log.warning(
+                "no admin account yet - run `python -m app.create_admin` to make one"
+            )
+    except Exception:  # noqa: BLE001 — the table appears with `python -m app.migrate`
+        log.warning("admin_users table missing - run `python -m app.migrate`")
     if not payments_available():
         log.warning(
             "Razorpay keys are not set - sign-ups are saved but checkout stays closed"
@@ -76,9 +83,25 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().origins,
-    allow_methods=["GET", "POST", "PUT"],
-    allow_headers=["Content-Type", "X-Admin-Token"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
+    # The export's filename, so the panel can save it under its proper name.
+    expose_headers=["Content-Disposition"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Headers every answer carries. None of this API is meant to be framed,
+    sniffed into another type, or leak where a reader came from; and nothing
+    from the admin panel — reader addresses, above all — is ever cached."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith("/api/admin"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.exception_handler(RequestValidationError)
@@ -148,4 +171,6 @@ async def health() -> JSONResponse:
 
 
 app.include_router(subscriptions.router)
+app.include_router(media.router)
+app.include_router(admin.public)
 app.include_router(admin.router)

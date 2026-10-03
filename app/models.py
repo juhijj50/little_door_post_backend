@@ -7,10 +7,12 @@ form shows are written in one place.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+
+from .countries import canonical, is_served, refusal
 
 Str = Annotated[str, Field(strip_whitespace=True)]
 
@@ -32,7 +34,7 @@ class SubscriberIn(BaseModel):
     region: Literal["india", "international"]
     # How many monthly envelopes they are buying. The price for it comes from
     # the plans table, never from the request — a client cannot name its own.
-    plan_months: Literal[1, 3, 6] = 1
+    plan_months: Literal[1, 3, 6, 12] = 1
 
     first_name: Str = Field(min_length=1, max_length=60)
     # Optional: plenty of people go by one name, and the surname is never
@@ -160,8 +162,28 @@ class SubscriberIn(BaseModel):
             if not self.pincode or not PINCODE_RE.match(self.pincode):
                 problems["pincode"] = "An Indian PIN code is six digits"
             self.country = "India"
-        elif not self.country:
-            problems["country"] = "Country is required"
+        else:
+            # Abroad. The address shapes vary far too much to validate beyond
+            # "there is one", but the country is checked hard: the dropdown on
+            # the form is a convenience, and this is the rule.
+            required = {
+                "address_line1": "Street address is required",
+                "city": "City or town is required",
+                "instagram": "Instagram handle is required",
+            }
+            for field, message in required.items():
+                if not getattr(self, field):
+                    problems[field] = message
+
+            resolved = canonical(self.country)
+            if not self.country:
+                problems["country"] = "Country is required"
+            elif not is_served(self.country):
+                problems["country"] = refusal(self.country)
+            else:
+                # Stored in one spelling however it was typed, so the posting
+                # list groups properly and a country is not three countries.
+                self.country = resolved
 
         if self.is_gift and not self.gift_message:
             problems["gift_message"] = "Write a line to go in with the gift"
@@ -287,19 +309,40 @@ class AdminStatusIn(BaseModel):
     note: Str | None = Field(default=None, max_length=600)
 
 
-class CycleIn(BaseModel):
-    """Overrides one month's sign-up window. Both dates must carry a timezone,
-    so there is never a question of whose midnight is meant."""
+# ── the admin panel ─────────────────────────────────────────────────────────
 
-    opens_at: datetime
-    closes_at: datetime
-    note: Str | None = Field(default=None, max_length=600)
+class LoginIn(BaseModel):
+    username: Str = Field(min_length=1, max_length=60)
+    # Not stripped: a password is exactly what was typed.
+    password: str = Field(min_length=1, max_length=200)
 
-    @model_validator(mode="after")
-    def check_order(self):
-        if self.closes_at <= self.opens_at:
-            raise ValueError("closes_at: the window has to close after it opens")
-        return self
+
+class PasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=10, max_length=200)
+
+
+CYCLE_PATTERN = r"^20\d\d-(0[1-9]|1[0-2])$"
+
+
+class EditionIn(BaseModel):
+    """Which edition is on sale, and whether it has sold out."""
+
+    cycle: Str = Field(pattern=CYCLE_PATTERN, description="'YYYY-MM', e.g. '2026-11'.")
+    status: Literal["open", "sold_out"]
+
+
+class EnvelopeItem(BaseModel):
+    title: Str = Field(min_length=1, max_length=80)
+    detail: Str = Field(default="", max_length=300)
+
+
+class EditionContentsIn(BaseModel):
+    """What is in one edition's envelope, in the order the site shows it, and
+    the photograph of that envelope (an id from an upload with kind=envelope)."""
+
+    items: list[EnvelopeItem] = Field(min_length=1, max_length=20)
+    envelope_media_id: str | None = None
 
 
 class PlanIn(BaseModel):
@@ -324,20 +367,3 @@ class PlanIn(BaseModel):
         description="Defaults to INR for india, USD for international.",
     )
     active: bool = Field(default=True, description="Unset to hide this length from the site.")
-
-
-class FoundingMemberIn(BaseModel):
-    """One of September's readers, who keeps the founding rate for good."""
-
-    first_name: Str = Field(min_length=1, max_length=60)
-    last_name: Str | None = Field(default=None, max_length=60)
-    phone_cc: Str = Field(default="+91", max_length=6)
-    phone_number: Str = Field(min_length=4, max_length=20)
-    code: Str = Field(default="FOUNDING15", max_length=32)
-    rate_minor: int = Field(default=30000, gt=0, description="Per month, in paise.")
-    note: Str | None = Field(default=None, max_length=300)
-
-    @field_validator("code")
-    @classmethod
-    def upper(cls, v: str) -> str:
-        return v.upper().replace(" ", "")

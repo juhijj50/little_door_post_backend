@@ -17,8 +17,6 @@ class Settings(BaseSettings):
 
     database_url: str = ""
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    admin_token: str = ""
-
 
     # Where a reminder request is sent. Gmail needs an app password, not the
     # account password: Google Account > Security > 2-Step Verification >

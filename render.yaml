@@ -52,9 +52,10 @@ services:
       - key: DATABASE_URL
         sync: false
 
-      # Guards /api/admin/*. Use a different value from your local .env.
-      - key: ADMIN_TOKEN
-        sync: false
+      # No admin token any more: the admin panel signs in with a username and
+      # password kept (hashed) in the database. Make one from your own machine
+      # with `python -m app.create_admin`. An ADMIN_TOKEN left set in the
+      # dashboard is simply ignored — delete it when convenient.
 
       # The site's exact origin: scheme included, no trailing slash, no path.
       # Comma-separate several. Get this wrong and the API looks healthy while
@@ -76,7 +77,7 @@ services:
       # The sender address must be verified in Brevo first: Senders, Domains &
       # Dedicated IPs > Senders. A Gmail address is fine, no domain needed.
       #
-      # Check it after a deploy:  POST /api/admin/test-email
+      # Check it after a deploy: the admin panel's Account tab.
       - key: BREVO_API_KEY
         sync: false
       - key: EMAIL_FROM
