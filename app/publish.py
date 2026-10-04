@@ -22,7 +22,12 @@ One publish is ONE commit (the Git Data API: blobs, a tree, a commit, a ref
 update), however many files changed — otherwise ten gallery uploads would start
 ten site builds. Photographs are named by their id and never change, so one
 already in the repository is left alone; one nothing points at any more is
-deleted. Only files named like that are ever deleted, so anything put in
+deleted.
+
+The repository is where a photograph LIVES. The database holds its bytes only
+on the way there: once a photograph has been in the repository for a while its
+`media.data` is emptied (the row stays — id, type, caption), and the panel is
+sent to the site's copy instead (see media.serve). Only files named like that are ever deleted, so anything put in
 public/media by hand is safe.
 
 Saves in the panel call schedule(), which waits a few seconds for more changes
@@ -63,6 +68,11 @@ EXT = {"image/webp": "webp", "image/jpeg": "jpg", "image/png": "png"}
 # uploaded one after another are one publish, not ten.
 DEBOUNCE_SECONDS = 10
 
+# How long a photograph's bytes stay in the database after it was uploaded,
+# even once it is in the repository: the site takes a minute or so to rebuild,
+# and until it has, the database is the only place the panel can show it from.
+KEEP_BYTES = "30 minutes"
+
 HEADER = (
     "/* Written by the admin panel's publish step - do not edit by hand; the next\n"
     " * publish would overwrite it. Change this in the panel instead. */\n"
@@ -88,6 +98,22 @@ status: dict = {
 
 _lock = asyncio.Lock()
 _timer: asyncio.Task | None = None
+
+
+def repo_path(media_id, content_type: str) -> str:
+    return f"{MEDIA_DIR}/{media_id}.{EXT[content_type]}"
+
+
+def site_url(media_id, content_type: str) -> str:
+    """Where a published photograph is, for a browser that is not on the site
+    itself (the panel, asking this API): the live site if we know its address,
+    otherwise GitHub's copy of the file."""
+    s = get_settings()
+    path = repo_path(media_id, content_type)
+    live = [o for o in s.origins if "localhost" not in o and "127.0.0.1" not in o]
+    if live:
+        return f"{live[0]}/{path.removeprefix('public/')}"
+    return f"https://raw.githubusercontent.com/{s.github_repo}/{s.github_branch}/{path}"
 
 
 def configured() -> bool:
@@ -204,8 +230,12 @@ def _id_of(url: str | None) -> str | None:
     return url.rsplit("/", 1)[-1] if url else None
 
 
-async def _snapshot() -> tuple[dict[str, str], dict[str, str]]:
-    """The four content files as text, and each photograph's id -> repo path."""
+async def _snapshot(in_repo: set[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """The four content files as text, and each photograph's id -> repo path.
+
+    `in_repo` is every file the repository holds. A photograph counts only if
+    it can actually be put on the site: it is there already, or the database
+    still has its bytes to send."""
     edition = await cycles.current()
     items = await cycles.contents_for(edition)
     catalogue = await plans.catalogue()
@@ -216,14 +246,22 @@ async def _snapshot() -> tuple[dict[str, str], dict[str, str]]:
     wanted = {g["id"] for g in gallery}
     wanted |= {i for i in (_id_of(site[s]) for s in media.SLOTS) if i}
     envelope_id = str(edition["envelope_media_id"]) if edition.get("envelope_media_id") else None
-    if envelope_id:
-        wanted.add(envelope_id)
+    # Every edition's envelope photograph is kept, not only this month's: the
+    # repository is the only copy, and the panel still shows past editions.
+    wanted |= {
+        str(r["envelope_media_id"]) for r in await fetch_all(
+            "select envelope_media_id from cycles where envelope_media_id is not null"
+        )
+    }
 
     rows = await fetch_all(
-        "select id, content_type from media where id = any(%s)",
+        "select id, content_type, data is not null as has_bytes from media where id = any(%s)",
         ([uuid.UUID(i) for i in wanted],),
     ) if wanted else []
-    paths = {str(r["id"]): f"{MEDIA_DIR}/{r['id']}.{EXT[r['content_type']]}" for r in rows}
+    paths = {
+        str(r["id"]): repo_path(r["id"], r["content_type"]) for r in rows
+        if r["has_bytes"] or repo_path(r["id"], r["content_type"]) in in_repo
+    }
 
     def src(media_id: str | None) -> str | None:
         # Public path, as the browser asks for it: public/ is the site's root.
@@ -254,8 +292,8 @@ async def _snapshot() -> tuple[dict[str, str], dict[str, str]]:
 
 
 async def _publish() -> dict:
-    texts, paths = await _snapshot()
     repo = await run_in_threadpool(_inspect)
+    texts, paths = await _snapshot(set(repo["files"]))
 
     # Only photographs the repository does not hold yet are read out of the
     # database — their bytes are the heavy part.
@@ -268,7 +306,21 @@ async def _publish() -> dict:
         )
         photos = {missing[str(r["id"])]: bytes(r["data"]) for r in rows}
 
-    return await run_in_threadpool(_commit, repo, texts, photos, set(paths.values())) or {}
+    result = await run_in_threadpool(_commit, repo, texts, photos, set(paths.values())) or {}
+
+    # Photographs that were in the repository before this publish began, and
+    # were uploaded long enough ago for the site to have rebuilt: the database
+    # no longer needs their bytes.
+    settled = [uuid.UUID(i) for i, p in paths.items() if p in repo["files"]]
+    if settled:
+        freed = await fetch_all(
+            f"update media set data = null where id = any(%s) and data is not null "
+            f"and created_at < now() - interval '{KEEP_BYTES}' returning id",
+            (settled,),
+        )
+        if freed:
+            log.info("emptied %d photographs from the database; the repository has them", len(freed))
+    return result
 
 
 # ── when ────────────────────────────────────────────────────────────────────

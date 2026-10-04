@@ -1,7 +1,9 @@
 """Photographs: the gallery, and each edition's envelope.
 
-Stored in Postgres (see `media` in schema.sql for why not on disk), uploaded
-from the admin panel, and served publicly from /api/media/{id}.
+Uploaded from the admin panel into Postgres, published from there into the
+site's own repository (publish.py), and then emptied from the database — the
+row stays, its bytes go. /api/media/{id} serves the bytes while they are here,
+and afterwards sends the browser to the site's copy.
 
 An upload is trusted for nothing. Its type is read from the file's own first
 bytes — the browser's Content-Type is ignored — and only JPEG, PNG and WebP
@@ -13,6 +15,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 
 from .db import fetch_all, fetch_one
 
@@ -147,6 +150,10 @@ async def serve(media_id: str) -> Response:
     )
     if not row:
         raise HTTPException(status_code=404, detail="No such photo.")
+    if row["data"] is None:
+        # Published and emptied from the database: the site has it now.
+        from . import publish  # here, not at the top: publish imports this module
+        return RedirectResponse(publish.site_url(media_id, row["content_type"]), status_code=302)
     return Response(
         content=bytes(row["data"]),
         media_type=row["content_type"],

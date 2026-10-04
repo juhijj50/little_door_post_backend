@@ -438,6 +438,11 @@ create table if not exists media (
 
 create index if not exists media_gallery_idx on media (created_at desc) where kind = 'gallery';
 
+-- A photograph's bytes are only here on the way to the site's repository
+-- (app/publish.py). Once it has been published the bytes are emptied and the
+-- row stays, so `data` may be null: "published, ask the site for it".
+alter table media alter column data drop not null;
+
 
 -- ── editions ─────────────────────────────────────────────────────────────────
 -- An edition is one month's envelope, filed under `cycles` as before. Sign-up
