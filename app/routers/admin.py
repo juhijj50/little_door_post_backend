@@ -18,6 +18,12 @@ Every route here except /login sits behind a signed-in session (see app/auth.py)
     PUT    /theme                       the colour palettes of buttons and headings
     POST   /media                       upload a photo
     DELETE /media/{id}                  delete a photo
+    GET    /publish                     is the site up to date with the panel?
+    POST   /publish                     send everything to the site now
+
+Saving anything the site shows (prices, the envelope, photographs, colours, the
+edition) also schedules a publish: the site's own files are rewritten through
+the GitHub API a few seconds later — see app/publish.py.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from psycopg.types.json import Jsonb
 
-from .. import auth, cycles, design, mail, media, plans, ratelimit
+from .. import auth, cycles, design, mail, media, plans, publish, ratelimit
 from ..db import fetch_all, fetch_one
 from ..export import edition_workbook
 from ..models import (
@@ -157,6 +163,7 @@ async def overview(request: Request) -> dict:
         "theme": await design.theme(),
         "palettes": list(design.PALETTES),
         "email": {"transport": mail.transport(), "last": mail.last_result},
+        "publish": publish.describe(),
     }
 
 
@@ -176,6 +183,7 @@ async def set_edition(body: EditionIn) -> dict:
     counted = {}
     if body.cycle > before["cycle"]:
         counted[before["cycle"]] = await cycles.close_edition(before["cycle"])
+    publish.schedule()
     return {"edition": await _edition_out(row), "counted": counted}
 
 
@@ -241,6 +249,7 @@ async def set_contents(cycle: str, body: EditionContentsIn) -> dict:
             "and not exists (select 1 from cycles where envelope_media_id = %s) returning id",
             (old, old),
         )
+    publish.schedule()
     return {"edition": await _edition_out(row)}
 
 
@@ -343,6 +352,7 @@ async def set_plan(region: str, months: int, body: PlanIn) -> dict:
         """,
         (region, months, currency, body.amount_minor, body.active),
     )
+    publish.schedule()
     return {"plan": {**row, **plans.as_dict(row)}}
 
 
@@ -403,6 +413,7 @@ async def set_site_image(slot: str, body: SiteImageIn) -> dict:
             "and not exists (select 1 from site_images where media_id = %s) returning id",
             (old, old),
         )
+    publish.schedule()
     return {"slot": slot, "url": media.url(image_id), "text_tone": tone or "light", **frame}
 
 
@@ -422,6 +433,7 @@ async def set_theme(body: ThemeIn) -> dict:
                 status_code=422, detail=f"{value} is neither a palette nor a colour like #4f46e5."
             )
         await design.set_value(key, value.lower() if value.startswith("#") else value)
+    publish.schedule()
     return {"theme": await design.theme()}
 
 
@@ -437,6 +449,8 @@ async def upload(
         raise HTTPException(status_code=422, detail="kind must be gallery or envelope.")
     data = await media.read_upload(request)
     row = await media.save(kind, data, (caption or "").strip() or None)
+    if kind == "gallery":
+        publish.schedule()  # the others only reach the site once they are assigned
     return {
         "id": str(row["id"]),
         "url": media.url(row["id"]),
@@ -453,4 +467,24 @@ async def delete_media(media_id: str) -> dict:
     )
     if not row:
         raise HTTPException(status_code=404, detail="No such photo.")
+    publish.schedule()
     return {"deleted": str(row["id"])}
+
+
+# ── the site's own files ────────────────────────────────────────────────────
+
+@router.get("/publish")
+async def publish_status() -> dict:
+    """Where the last publish got to. The panel polls this while one is due."""
+    return publish.describe()
+
+
+@router.post("/publish")
+async def publish_now() -> dict:
+    """Send everything the site shows to GitHub right now, rather than waiting
+    for the few seconds after the last save. Also the way to put the site right
+    if an earlier publish failed, or to fill it for the first time."""
+    try:
+        return await publish.publish()
+    except publish.PublishError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from None

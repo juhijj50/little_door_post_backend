@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     brevo_api_key: str = ""
     email_from: str = ""
 
+    # Publishing the site's content to the frontend's GitHub repo (see
+    # publish.py). A fine-grained token with Contents: read and write on that one
+    # repository. Without it the panel still saves to the database; the site just
+    # is not updated.
+    github_token: str = ""
+    github_repo: str = "juhijj50/little_door_post"
+    github_branch: str = "main"
+
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
