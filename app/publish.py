@@ -246,13 +246,8 @@ async def _snapshot(in_repo: set[str]) -> tuple[dict[str, str], dict[str, str]]:
     wanted = {g["id"] for g in gallery}
     wanted |= {i for i in (_id_of(site[s]) for s in media.SLOTS) if i}
     envelope_id = str(edition["envelope_media_id"]) if edition.get("envelope_media_id") else None
-    # Every edition's envelope photograph is kept, not only this month's: the
-    # repository is the only copy, and the panel still shows past editions.
-    wanted |= {
-        str(r["envelope_media_id"]) for r in await fetch_all(
-            "select envelope_media_id from cycles where envelope_media_id is not null"
-        )
-    }
+    if envelope_id:
+        wanted.add(envelope_id)
 
     rows = await fetch_all(
         "select id, content_type, data is not null as has_bytes from media where id = any(%s)",
@@ -293,6 +288,23 @@ async def _snapshot(in_repo: set[str]) -> tuple[dict[str, str], dict[str, str]]:
 
 async def _publish() -> dict:
     repo = await run_in_threadpool(_inspect)
+
+    # An edition that is over has no use for its envelope photograph: the site
+    # only ever shows the one on sale. Its row goes (the foreign key empties
+    # cycles.envelope_media_id), and with nothing pointing at it the file is
+    # deleted from the repository in the commit below. An edition written ahead
+    # of time keeps its photograph, in the database, until it goes on sale.
+    cleared = await fetch_all(
+        """
+        delete from media where kind = 'envelope' and id in (
+            select c.envelope_media_id from cycles c, current_edition e
+            where c.cycle < e.cycle and c.envelope_media_id is not null
+        ) returning id
+        """
+    )
+    if cleared:
+        log.info("removed %d envelope photographs of past editions", len(cleared))
+
     texts, paths = await _snapshot(set(repo["files"]))
 
     # Only photographs the repository does not hold yet are read out of the
