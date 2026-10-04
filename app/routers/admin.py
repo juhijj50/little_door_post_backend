@@ -32,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from psycopg.types.json import Jsonb
 
-from .. import auth, cycles, design, mail, media, plans, publish, ratelimit
+from .. import auth, cycles, design, giveaway, mail, media, plans, publish, ratelimit
 from ..db import fetch_all, fetch_one
 from ..export import edition_workbook
 from ..models import (
@@ -95,6 +95,7 @@ async def _edition_out(row: dict) -> dict:
         "envelope_media_id": str(row["envelope_media_id"]) if row.get("envelope_media_id") else None,
         "envelope_image": media.url(row.get("envelope_media_id")),
         "counted": row.get("rolled_over_at") is not None,
+        "giveaway_code": row.get("giveaway_code"),
     }
 
 
@@ -213,9 +214,22 @@ async def undo_count(cycle: str) -> dict:
 
 @router.put("/editions/{cycle}")
 async def set_contents(cycle: str, body: EditionContentsIn) -> dict:
-    """What is in one edition's envelope, and its photograph."""
+    """What is in one edition's envelope, its photograph, and its giveaway
+    code (if it has one)."""
     if not cycles.valid_cycle(cycle):
         raise HTTPException(status_code=422, detail="An edition is written YYYY-MM.")
+
+    code = giveaway.tidy(body.giveaway_code)
+    if code and not giveaway.CODE_RE.match(code):
+        raise HTTPException(
+            status_code=422,
+            detail="A giveaway code is 4 to 32 letters, numbers, _ or -.",
+        )
+    if code and await fetch_one("select 1 as x from founding_members where upper(code) = %s", (code,)):
+        raise HTTPException(
+            status_code=422,
+            detail="That is already a founding member's code. Choose another.",
+        )
 
     image_id = None
     if body.envelope_media_id:
@@ -229,15 +243,16 @@ async def set_contents(cycle: str, body: EditionContentsIn) -> dict:
     previous = await cycles.get(cycle)
     row = await fetch_one(
         """
-        insert into cycles (cycle, status, contents, envelope_media_id)
-        values (%s, 'open', %s, %s)
+        insert into cycles (cycle, status, contents, envelope_media_id, giveaway_code)
+        values (%s, 'open', %s, %s, %s)
         on conflict (cycle) do update set
             contents = excluded.contents,
             envelope_media_id = excluded.envelope_media_id,
+            giveaway_code = excluded.giveaway_code,
             updated_at = now()
         returning *
         """,
-        (cycle, Jsonb([i.model_dump() for i in body.items]), image_id),
+        (cycle, Jsonb([i.model_dump() for i in body.items]), image_id, code),
     )
 
     # A replaced envelope photo is nobody's any more — clear it out rather than

@@ -48,8 +48,8 @@ async def rate_for(
 
     if member is None:
         return standard_minor, None, (
-            "That code belongs to a different number. "
-            "Use the phone you signed up with in September, or clear the code."
+            "That code does not work here. If it is a founding code, use the phone "
+            "you signed up with in September; otherwise check it, or clear it."
         )
 
     if member["code"] != code:

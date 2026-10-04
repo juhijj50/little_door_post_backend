@@ -605,3 +605,10 @@ create table if not exists site_settings (
     value       text not null,
     updated_at  timestamptz not null default now()
 );
+
+
+-- ── giveaway codes ──────────────────────────────────────────────────────────
+-- One per edition, typed into the admin panel. While that edition is on sale,
+-- a sign-up quoting it is not charged for that edition's envelope (see
+-- app/giveaway.py). Null means that edition has no giveaway.
+alter table cycles add column if not exists giveaway_code text;

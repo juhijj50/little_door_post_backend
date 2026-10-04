@@ -343,6 +343,8 @@ class EditionContentsIn(BaseModel):
 
     items: list[EnvelopeItem] = Field(min_length=1, max_length=20)
     envelope_media_id: str | None = None
+    # This edition's giveaway code; empty or null means it has none.
+    giveaway_code: Str | None = Field(default=None, max_length=40)
 
 
 class SiteImageIn(BaseModel):

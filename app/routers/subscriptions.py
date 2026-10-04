@@ -7,7 +7,10 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import countries, cycles, design, founding, identity, mail, media, payments, plans, ratelimit
+from .. import (
+    countries, cycles, design, founding, giveaway, identity, mail, media, payments, plans,
+    ratelimit,
+)
 from ..config import get_settings, make_reference
 from ..cycles import month_name
 from ..db import fetch_one
@@ -276,6 +279,11 @@ async def _confirm_to_reader(row: dict, credited: dict) -> None:
     amount = plans.display(credited["amount_minor"], credited["currency"])
     envelopes = "one envelope" if months == 1 else f"{months} envelopes, one a month"
     edition = month_name(row["cycle"])
+    # A giveaway: that edition's envelope was not charged for.
+    paid_line = (
+        f"There is nothing to pay for {envelopes}" if not credited["amount_minor"]
+        else f"You have paid {amount} for {envelopes}"
+    )
 
     try:
         items = await cycles.contents_for(await cycles.get(row["cycle"]))
@@ -289,7 +297,7 @@ async def _confirm_to_reader(row: dict, credited: dict) -> None:
 Thank you - your subscription to The Little Door Post is confirmed, and Iris
 has your address.
 
-You have paid {amount} for {envelopes}, starting with the {edition} edition.
+{paid_line}, starting with the {edition} edition.
 Your first envelope is posted when the {edition} edition goes out, and should
 reach you within about a week of that in India (two to six weeks abroad).
 
@@ -412,8 +420,8 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
             ) + "\n"
 
         await mail.notify(
-            f"Paid: {row['full_name']} — {amount}",
-            f"{row['full_name']} has paid for {length}"
+            f"{'Paid' if credited['amount_minor'] else 'Giveaway'}: {row['full_name']} — {amount}",
+            f"{row['full_name']} has {'paid' if credited['amount_minor'] else 'signed up with a giveaway code'} for {length}"
             f"{'' if months == 1 else f' at {rate} a month'}"
             f" — one envelope each month.\n\n"
             f"  Reference : {row['reference']}\n"
@@ -583,18 +591,28 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
     # `plan["amount_minor"]` is the rate for ONE month. A longer plan is a
     # longer commitment at a better monthly rate, not a bundle bought at once —
     # one letter still arrives each month — so the charge is rate x months.
-    rate, applied_code, problem = await founding.rate_for(
-        phone=body.phone,
-        region=body.region,
-        code=body.promo_code,
-        standard_minor=plan["amount_minor"],
-    )
+    #
+    # The giveaway code of the edition on sale (set in the admin panel) makes
+    # that edition free: that one envelope is not charged for, and any months
+    # after it are, at the ordinary rate. Looked at first, because a founding
+    # code is checked against a phone number and would refuse this one as
+    # somebody else's.
+    free, problem = giveaway.is_free(body.promo_code, cycle), None
+    if free:
+        rate, applied_code = plan["amount_minor"], body.promo_code
+    else:
+        rate, applied_code, problem = await founding.rate_for(
+            phone=body.phone,
+            region=body.region,
+            code=body.promo_code,
+            standard_minor=plan["amount_minor"],
+        )
     if problem:
         raise HTTPException(
             status_code=422,
             detail={"error": problem, "fields": {"promo_code": problem}},
         )
-    amount = rate * body.plan_months
+    amount = rate * (body.plan_months - 1 if free else body.plan_months)
 
     # Who this is. First name plus phone, both reduced to a stable key, so the
     # same reader coming back next month lands on the row they already have
@@ -707,6 +725,14 @@ async def create_subscription(body: SubscriberIn) -> SubscribeResponse:
         (row["id"], cycle["cycle"], body.plan_months, plan["currency"],
          amount, rate, applied_code),
     )
+
+    # Nothing to pay — a giveaway code on a one-month plan. There is no checkout
+    # to open for ₹0, so the sign-up is credited here and now, through the same
+    # door a payment comes through: the reader is filed, counted for this
+    # edition, and both emails go out.
+    if amount == 0:
+        reader = await _credit(payment_row, None)
+        return SubscribeResponse(subscription=_out(reader), payment=None)
 
     return SubscribeResponse(
         subscription=_out(row),
