@@ -294,16 +294,10 @@ async def _confirm_to_reader(row: dict, credited: dict) -> None:
             f"Your letters are on their way, {row['first_name']}",
             f"""Dear {row['first_name']},
 
-Thank you - your subscription to The Little Door Post is confirmed, and Iris
-has your address.
+Thank you - your subscription to The Little Door Post is confirmed, and Iris has your address.
 
 {paid_line}, starting with the {edition} edition.
-Your first envelope is posted when the {edition} edition goes out, and should
-reach you within about a week of that in India (two to six weeks abroad).
-
-In the {edition} envelope:
-
-{contents}
+Your first envelope is posted when the {edition} edition goes out, and should reach you within about a week of that in India (two to six weeks abroad).
 
 Keep these somewhere safe:
 
@@ -311,15 +305,10 @@ Keep these somewhere safe:
   Payment id     : {credited.get('razorpay_payment_id') or '(pending)'}
   Amount paid    : {amount}
 
-Quote the reference if you ever write to us - about a change of address, a
-letter that has not arrived, or anything at all.
-
-One thing worth saying plainly: this does not renew by itself. You have bought
-{envelopes} and nothing more; we cannot charge you again.
+Quote the reference if you ever write to us - about a change of address, a letter that has not arrived, or anything at all.
 
 Posting to: {row['address_line1'] or ''}, {row['city'] or ''} {row['pincode'] or ''}, {row['country'] or ''}.
-If any of that is wrong, tell us before 1 {edition} and we will fix it. That
-is also the last day to cancel for a full refund.
+If any of that is wrong, tell us before 1 {edition} and we will fix it. That is also the last day to cancel for a full refund.
 
 With love, and a great deal of paper,
 Iris
