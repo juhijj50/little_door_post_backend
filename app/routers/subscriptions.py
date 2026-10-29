@@ -745,13 +745,37 @@ async def get_subscription(subscription_id: str) -> SubscribeResponse:
 
 @router.post("/subscriptions/{subscription_id}/order", response_model=PaymentOut)
 async def create_order(subscription_id: str) -> PaymentOut:
-    """Re-open checkout for a sign-up that was left unpaid."""
+    """Called by the site every time the Pay button is pressed, just before
+    Razorpay Checkout opens.
+
+    An unpaid sign-up is deleted 24 hours after it was last touched
+    (cycles.discard_abandoned), but the Razorpay order behind it never expires
+    on Razorpay's side. A tab left open overnight could once pay that old order
+    after its sign-up was gone — money taken, nothing on file to post to. So
+    checkout only ever opens through here: a deleted sign-up is refused before
+    any money moves, and a live one has its clock reset, so it cannot be swept
+    while its checkout is open.
+    """
     row, is_attempt = await _find_signup(subscription_id)
     if not row:
-        raise HTTPException(status_code=404, detail="No such sign-up.")
+        raise HTTPException(
+            status_code=404,
+            detail="This sign-up has expired and nothing has been charged. "
+            "Please fill in the form again.",
+        )
     if not is_attempt:
         # It is in `subscribers`, which is only ever reached by paying.
         raise HTTPException(status_code=409, detail="This sign-up is already paid for.")
+
+    await fetch_one(
+        "update signup_attempts set updated_at = now() where id = %s returning id",
+        (row["id"],),
+    )
+    await fetch_one(
+        "update payments set updated_at = now() "
+        "where attempt_id = %s and status = 'pending' returning id",
+        (row["id"],),
+    )
     return await _payment_for(row)
 
 
@@ -849,8 +873,16 @@ async def razorpay_webhook(request: Request) -> dict:
     )
     if not payment:
         # An order from another system, or one whose sign-up was discarded as
-        # abandoned. Nothing to do, and nothing Razorpay should retry.
-        log.info("razorpay webhook: %s for unknown order %s", kind, order_id)
+        # abandoned. Nothing to do, and nothing Razorpay should retry — but a
+        # *captured* one means money was taken with nothing on file, so it is
+        # logged loudly enough to find.
+        if kind == "payment.captured":
+            log.error(
+                "razorpay webhook: payment %s captured for unknown order %s (%s, %s)",
+                entity.get("id"), order_id, entity.get("email"), entity.get("contact"),
+            )
+        else:
+            log.info("razorpay webhook: %s for unknown order %s", kind, order_id)
         return _ACK
 
     if kind == "payment.captured":
