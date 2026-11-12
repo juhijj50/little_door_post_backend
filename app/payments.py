@@ -79,6 +79,33 @@ async def verify_signature(*, order_id: str, payment_id: str, signature: str) ->
         return False
 
 
+async def order_outcome(order_id: str) -> tuple[str, str | None]:
+    """Ask Razorpay what really became of an order.
+
+    Returns ``("paid", <payment_id>)`` when the gateway actually has the money,
+    and ``("unpaid", None)`` when it does not. It *raises* if Razorpay cannot be
+    reached — so a caller deciding whether to delete a row can tell "definitely
+    never paid" apart from "could not check", and keep the row in the second
+    case rather than throwing away a payment it simply failed to confirm.
+
+    This is the server asking the gateway directly, which is the only source of
+    truth that does not depend on the browser callback or the webhook arriving.
+    """
+    client = _client()
+    order = await run_in_threadpool(client.order.fetch, order_id)
+    if order.get("status") != "paid":
+        return "unpaid", None
+
+    listing = await run_in_threadpool(client.order.payments, order_id)
+    captured = None
+    for item in listing.get("items", []):
+        if item.get("status") == "captured":
+            return "paid", item.get("id")
+        if item.get("status") == "authorized" and captured is None:
+            captured = item.get("id")
+    return "paid", captured
+
+
 async def verify_webhook(*, body: bytes, signature: str) -> bool:
     settings = get_settings()
     if not settings.razorpay_webhook_secret:

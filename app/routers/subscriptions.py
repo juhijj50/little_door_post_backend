@@ -13,7 +13,7 @@ from .. import (
 )
 from ..config import get_settings, make_reference
 from ..cycles import month_name
-from ..db import fetch_one
+from ..db import fetch_all, fetch_one
 from ..models import (
     InternationalInterestIn,
     InternationalInterestOut,
@@ -428,6 +428,80 @@ async def _credit(payment: dict, razorpay_payment_id: str | None) -> dict:
         log.exception("payment credited but could not be emailed: %s", row["reference"])
 
     return row
+
+
+async def reconcile_pending_payments() -> dict:
+    """The last safety net before a sign-up is swept: ask Razorpay whether its
+    payment actually went through.
+
+    The browser callback and the webhook are the normal ways a payment is
+    recorded, but both can miss — an international card that redirects for
+    3-D Secure and never lands back on the tab, or a webhook that is
+    misconfigured or arrives while the free-tier service is asleep. When both
+    miss, the money is taken but the payment sits `pending`, and the 24-hour
+    sweep (cycles.discard_abandoned) would once have deleted the reader along
+    with the address there is now no other copy of.
+
+    So every pending payment that opened a Razorpay order and is old enough to
+    be swept is checked against the gateway itself:
+
+      * paid  -> credited here, exactly as the callback would have: the reader
+                 is filed as a subscriber and both emails go out, only late.
+      * not   -> cleared, so the ordinary sweep can tidy the attempt away.
+      * can't reach Razorpay -> left untouched, to try again next sweep. A
+                 payment is never deleted on a guess; only on the gateway's
+                 own word that it was never paid.
+    """
+    if not payments.payments_available():
+        return {"credited": [], "cleared": []}
+
+    stuck = await fetch_all(
+        """
+        select * from payments
+        where status = 'pending'
+          and razorpay_order_id is not null
+          and updated_at < now() - (%s)::interval
+        """,
+        (cycles.ABANDONED_AFTER,),
+    )
+
+    credited, cleared = [], []
+    for payment in stuck:
+        order_id = payment["razorpay_order_id"]
+        try:
+            outcome, razorpay_payment_id = await payments.order_outcome(order_id)
+        except Exception:  # noqa: BLE001 — a gateway we cannot reach is no answer
+            log.exception("reconcile: could not check Razorpay order %s", order_id)
+            continue
+
+        if outcome == "paid":
+            try:
+                await _credit(payment, razorpay_payment_id)
+            except HTTPException:
+                # _credit raises this for the genuinely unfilable (e.g. the
+                # attempt is already gone and there is no subscriber). Logged
+                # loudly rather than retried forever.
+                log.exception("reconcile: order %s is paid but could not be filed", order_id)
+                continue
+            credited.append(order_id)
+            log.warning(
+                "reconcile: order %s had been paid but never recorded — credited now",
+                order_id,
+            )
+        else:
+            # Razorpay's own word that the money was never taken. Safe to clear,
+            # which lets discard_abandoned sweep the attempt behind it.
+            await fetch_one(
+                "delete from payments where id = %s and status = 'pending' returning id",
+                (payment["id"],),
+            )
+            cleared.append(order_id)
+
+    if credited or cleared:
+        log.info(
+            "reconcile: %d recovered, %d cleared as unpaid", len(credited), len(cleared)
+        )
+    return {"credited": credited, "cleared": cleared}
 
 
 @router.post(

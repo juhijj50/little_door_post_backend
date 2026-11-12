@@ -352,6 +352,14 @@ async def discard_abandoned() -> dict:
 
     An attempt with a *paid* payment against it is left alone: that is a
     promotion caught mid-flight, not an abandonment.
+
+    An attempt whose payment opened a Razorpay order but is still `pending` is
+    also left alone here, even past the deadline: that money may in fact have
+    been taken, so it belongs to reconcile_pending_payments(), which checks the
+    gateway before anything is deleted. Only once that has credited it (paid) or
+    cleared it (never paid) does it fall to this sweep. That is what stops a lost
+    callback *and* a lost webhook from costing a reader their subscription — and
+    us a payment we have no record of.
     """
     gone = await fetch_all(
         f"""
@@ -359,6 +367,10 @@ async def discard_abandoned() -> dict:
         where a.updated_at < now() - interval '{ABANDONED_AFTER}'
           and not exists (select 1 from payments p
                           where p.attempt_id = a.id and p.status = 'paid')
+          and not exists (select 1 from payments p
+                          where p.attempt_id = a.id
+                            and p.status = 'pending'
+                            and p.razorpay_order_id is not null)
         returning a.reference
         """
     )
@@ -367,6 +379,7 @@ async def discard_abandoned() -> dict:
         f"""
         delete from payments
         where status = 'pending'
+          and razorpay_order_id is null
           and updated_at < now() - interval '{ABANDONED_AFTER}'
         returning id
         """
@@ -383,6 +396,21 @@ async def discard_abandoned() -> dict:
 async def sweep() -> None:
     """Housekeeping that rides along on ordinary requests — Render's free plan
     has no cron, and a sleeping service would miss one anyway: abandoned
-    sign-ups, and admin sessions that have run out."""
+    sign-ups, and admin sessions that have run out.
+
+    Reconcile runs *before* the discard: it asks Razorpay about any payment
+    still `pending` past the deadline and credits the ones that were really
+    paid, so the discard that follows only ever sweeps sign-ups the gateway
+    agrees were never paid for.
+    """
+    # Imported here, not at module load: subscriptions imports cycles, so a
+    # top-level import the other way round would be circular.
+    from .routers import subscriptions
+
+    try:
+        await subscriptions.reconcile_pending_payments()
+    except Exception:  # noqa: BLE001 — a reconcile hiccup must not break the page
+        log.exception("reconcile pass failed; will retry on the next sweep")
+
     await discard_abandoned()
     await fetch_all("delete from admin_sessions where expires_at < now() returning token_hash")
