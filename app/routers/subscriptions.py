@@ -858,26 +858,12 @@ async def verify_payment(subscription_id: str, body: RazorpayVerifyIn) -> Subscr
     """Called by the site when Razorpay Checkout reports success.
 
     The signature is what makes this safe: without checking it, anyone could
-    POST arbitrary ids here and mark themselves paid.
+    POST arbitrary ids here and mark themselves paid. It is checked first, and
+    it is enough on its own — it proves the caller completed *this* Razorpay
+    order, whether or not the sign-up is still where the browser last saw it.
     """
     if not payments.payments_available():
         raise HTTPException(status_code=503, detail=payments.PAYMENTS_PENDING_MESSAGE)
-
-    row, is_attempt = await _find_signup(subscription_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="No such sign-up.")
-
-    # Keyed on whichever of the two this id turned out to be. After a webhook
-    # has already credited the payment, the attempt is gone and the id is the
-    # subscriber's — and _credit() below is idempotent, so a late browser
-    # callback lands harmlessly on the row that already exists.
-    column = "attempt_id" if is_attempt else "subscriber_id"
-    payment = await fetch_one(
-        f"select * from payments where {column} = %s and razorpay_order_id = %s",
-        (row["id"], body.razorpay_order_id),
-    )
-    if not payment:
-        raise HTTPException(status_code=400, detail="That payment belongs to a different sign-up.")
 
     ok = await payments.verify_signature(
         order_id=body.razorpay_order_id,
@@ -891,6 +877,24 @@ async def verify_payment(subscription_id: str, body: RazorpayVerifyIn) -> Subscr
             "please try again or write to us.",
         )
 
+    # The order id is the one key that survives promotion. The browser holds the
+    # sign-up's id, but by the time this call lands the webhook may already have
+    # credited the payment — which promotes the attempt into a *new* subscribers
+    # row (with a different id) and deletes the attempt. The browser never learns
+    # that new id, so looking the sign-up up by the id it is holding would find
+    # nothing and 404 a reader who has in fact paid. Finding the payment by its
+    # order id instead works either way, so a webhook that got here first turns
+    # this into a confirmation rather than a "no such sign-up".
+    payment = await fetch_one(
+        "select * from payments where razorpay_order_id = %s",
+        (body.razorpay_order_id,),
+    )
+    if not payment:
+        raise HTTPException(status_code=404, detail="No such sign-up.")
+
+    # _credit is idempotent: if the webhook has already credited this payment it
+    # re-reads the row and returns the subscriber, so a late browser callback
+    # lands harmlessly on the subscription that already exists.
     row = await _credit(payment, body.razorpay_payment_id)
 
     return SubscribeResponse(subscription=_out(row), payment=None)
